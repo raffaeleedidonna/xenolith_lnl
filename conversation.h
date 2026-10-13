@@ -269,6 +269,9 @@ conversation_status conversation_project_copy(const conversation *c,
                                                int close_current,
                                                int32_t **tokens,
                                                uint64_t *count);
+conversation_status conversation_cache_index(conversation_store *store, kvstore *cache);
+int conversation_snapshot_previous(const conversation *c, kvstore_id *id,
+                                    uint64_t *boundary, uint64_t *event_index);
 int conversation_snapshot_current(const conversation *c, kvstore_id *id,
                                   uint64_t *boundary);
 uint64_t conversation_event_count(const conversation *c);

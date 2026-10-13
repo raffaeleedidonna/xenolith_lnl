@@ -188,7 +188,7 @@ int main(void) {
     store_fill(session, 4, 9);
     ok &= kvstore_load(store, &first, session, &expected, &core) == KVSTORE_OK;
     int load_ok = ok;
-    printf("kvstore: load and hits %s\n",
+    printf("kvstore: load and recency %s\n",
            load_ok && publish_ok ? "PASS" : "FAIL");
     ok &= core == XE_SNAPSHOT_OK &&
           store_state_matches(session, expected_ids, 4, 0);
@@ -200,6 +200,9 @@ int main(void) {
     kvstore_status save_second = kvstore_save(store, session, &options,
                                               &second, &core);
     ok &= save_second == KVSTORE_OK;
+    /* LRU: touch first AFTER second was saved; historical hit counts do not
+     * keep it alive against a more recent save. */
+    ok &= kvstore_load(store, &first, session, &expected, &core) == KVSTORE_OK;
     store_key(options.key, 3);
     kvstore_status save_third = kvstore_save(store, session, &options,
                                              &third, &core);
@@ -247,7 +250,7 @@ int main(void) {
 
     uint64_t total = 0, pinned = 0;
     ok &= kvstore_usage(store, &total, &pinned) == KVSTORE_OK;
-    ok &= total <= 2 * snapshot_size + 4096 && pinned == snapshot_size;
+    ok &= total <= 2 * snapshot_size + 4096 && pinned == snapshot_size + 128;
     engine.snapshot_fingerprint[XE_SNAPSHOT_FP_MODEL][0] ^= 1;
     uint64_t before = store_state_crc(session);
     ok &= kvstore_load(store, &system, session, &expected, &core) ==
@@ -306,7 +309,7 @@ int main(void) {
     ok &= stat(transcript, &transcript_st) == 0 && transcript_st.st_size == 7;
     kvstore_close(store);
 
-    printf("kvstore: atomic ids hits eviction pin isolation %s\n",
+    printf("kvstore: atomic ids LRU eviction pin isolation %s\n",
            ok ? "PASS" : "FAIL");
     xe_session_free(session);
     xe_worker_pool_destroy(&engine);

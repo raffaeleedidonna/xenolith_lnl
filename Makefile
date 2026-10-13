@@ -22,13 +22,13 @@ xenolith.o: xenolith.c xenolith.cl xenolith.h xenolith_internal.h format.h
 format.o: format.c format.h
 json.o: json.c json.h
 profile.o: profile.c profile.h xenolith.h format.h json.h
-kvstore.o: kvstore.c kvstore.h xenolith.h format.h
+kvstore.o: kvstore.c kvstore.h xenolith.h xenolith_internal.h format.h
 conversation.o: conversation.c conversation.h kvstore.h xenolith.h format.h
 runtime.o: runtime.c runtime.h xenolith.h xenolith_internal.h kvstore.h conversation.h profile.h format.h json.h
 serve.o: serve.c serve.h runtime.h xenolith.h kvstore.h conversation.h profile.h json.h
 
 clean:
-	rm -f *.o xenolith tests/certify tests/test_kv tests/test_kv_model tests/test_decode tests/test_context_limits \
+	rm -f *.o xenolith tests/test_cache_policy tests/test_cache_model tests/certify tests/test_kv tests/test_kv_model tests/test_decode tests/test_context_limits \
 		tests/test_model_decode tests/test_fixture_decode bench/bench_decode \
 		tests/test_prefill_projection tests/test_prefill_qkv tests/test_prefill_swa \
 		tests/test_prefill_dense tests/test_prefill_layer tests/test_prefill_session \
@@ -65,7 +65,7 @@ TEST_CFLAGS=-O2 -std=c11 -Wall -Wextra -pthread
 
 UNIT_TESTS=tests/test_inference tests/test_format tests/test_json tests/test_decode tests/test_conversation tests/test_gpu_alloc tests/test_context_limits
 GPU_TESTS=tests/test_kv tests/test_snapshot tests/test_kvstore tests/test_prefill_session
-PERSISTENCE_TESTS=tests/test_snapshot_model tests/test_conversation_model tests/test_session_sync
+PERSISTENCE_TESTS=tests/test_cache_model tests/test_snapshot_model tests/test_conversation_model tests/test_session_sync
 PREFILL_TESTS=tests/test_prefill_projection tests/test_prefill_qkv tests/test_prefill_swa \
 	tests/test_prefill_dense tests/test_prefill_layer tests/test_prefill_session
 ENGINE_TESTS=tests/test_snapshot tests/test_snapshot_model tests/test_kvstore \
@@ -131,6 +131,12 @@ tests/test_snapshot: tests/test_snapshot.c xenolith.c xenolith.h format.o $(GPU_
 
 tests/test_snapshot_model: tests/test_snapshot_model.c xenolith.c xenolith.h format.o $(GPU_OBJ)
 	$(CC) $(CFLAGS) -I. -o $@ tests/test_snapshot_model.c format.o $(GPU_OBJ) $(LDLIBS)
+
+tests/test_cache_model: tests/test_cache_model.c xenolith.c xenolith.h kvstore.o format.o $(GPU_OBJ)
+	$(CC) $(CFLAGS) -I. -o $@ $< kvstore.o format.o $(GPU_OBJ) $(LDLIBS)
+
+tests/test_cache_policy: tests/test_cache_policy.c tests/snapshot_compat_fixture.c xenolith.c xenolith.h kvstore.o format.o $(GPU_OBJ)
+	$(CC) $(CFLAGS) -I. -o $@ $< kvstore.o format.o $(GPU_OBJ) $(LDLIBS)
 
 tests/test_kvstore: tests/test_kvstore.c xenolith.c xenolith.h kvstore.o kvstore.c kvstore.h format.o $(GPU_OBJ)
 	$(CC) $(CFLAGS) -I. -o $@ tests/test_kvstore.c kvstore.o format.o $(GPU_OBJ) $(LDLIBS)
@@ -245,7 +251,22 @@ check-kv check-kv-edges check-gpu: check-kv-load-bounds
 check-inference: tests/test_inference
 	./tests/test_inference
 
-check-unit: $(UNIT_TESTS) check-kv-load-bounds
+check-cache-large: tests/test_cache_policy
+	./tests/test_cache_policy --large
+
+check-snapshot-compat-host: $(GPU_OBJ)
+	python3 tests/check_snapshot_compat.py --current-only --cc '$(CC)' --base-cflags '$(BASE_CFLAGS)'
+
+# Needs the historical commit in local Git history, or LEGACY_SOURCE pointing
+# to an unmodified export of it. No model or GPU device is needed.
+check-snapshot-compat: $(GPU_OBJ)
+	python3 tests/check_snapshot_compat.py --cc '$(CC)' --base-cflags '$(BASE_CFLAGS)' $(if $(LEGACY_SOURCE),--legacy-source '$(LEGACY_SOURCE)')
+
+check-snapshot-compat-model: require-model $(GPU_OBJ)
+	python3 tests/check_snapshot_compat.py --cc '$(CC)' --base-cflags '$(BASE_CFLAGS)' $(if $(LEGACY_SOURCE),--legacy-source '$(LEGACY_SOURCE)') --model '$(MODEL)'
+
+check-unit: tests/test_cache_policy $(UNIT_TESTS) check-kv-load-bounds check-snapshot-compat-host
+	./tests/test_cache_policy
 	@set -e; for test in $(UNIT_TESTS); do ./$$test; done
 
 check-gpu: $(GPU_TESTS)
@@ -327,6 +348,6 @@ test-tools-clean:
 require-model:
 	@test -f "$(MODEL)" || { printf '%s\n' 'Set MODEL to the path of the Gemma 4 GGUF file.' >&2; exit 2; }
 
-.PHONY: require-model clean check check-inference check-unit check-gpu check-context check-persistence check-prefill check-all \
-	check-kv check-kv-edges check-kv-load-bounds check-runtime check-serve golden test-tools test-tools-clean \
+.PHONY: check-cache-large require-model clean check check-inference check-unit check-gpu check-context check-persistence check-prefill check-all check-snapshot-compat-host check-snapshot-compat \
+	check-snapshot-compat-model check-kv check-kv-edges check-kv-load-bounds check-runtime check-serve golden test-tools test-tools-clean \
 	bench-b3b bench-b14 bench-prefill-gemm

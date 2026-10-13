@@ -261,7 +261,12 @@ static int runtime_default_cache_dir(char *out, size_t cap) {
 }
 
 runtime_status runtime_open(runtime **out, xe_engine *engine, const char *state_dir,
-                      const char *cache_dir) {
+                            const char *cache_dir) {
+    return runtime_open_with_budget(out, engine, state_dir, cache_dir, KVSTORE_DEFAULT_BUDGET);
+}
+
+runtime_status runtime_open_with_budget(runtime **out, xe_engine *engine, const char *state_dir,
+                      const char *cache_dir, uint64_t cache_budget) {
     if (!out || !engine) return RUNTIME_INVALID_ARGUMENT;
     *out = NULL;
     runtime *w = calloc(1, sizeof *w);
@@ -294,10 +299,20 @@ runtime_status runtime_open(runtime **out, xe_engine *engine, const char *state_
     if (!cache_dir && runtime_default_cache_dir(cache_path, sizeof cache_path))
         cache_dir = cache_path;
     w->kv_open_status = KVSTORE_OK;
-    if (cache_dir) {
+    if (!cache_budget) w->kv_open_status = KVSTORE_DISABLED;
+    if (cache_dir && cache_budget) {
         w->kv_open_status = (int)kvstore_open(&w->kv, cache_dir,
-                                              KVSTORE_DEFAULT_BUDGET);
+                                              cache_budget);
         if (w->kv_open_status != KVSTORE_OK) w->kv = NULL;
+        if (w->kv && conversation_cache_index(w->cstore, w->kv) != CONVERSATION_OK) {
+            kvstore_close(w->kv); w->kv = NULL; w->kv_open_status = KVSTORE_IO;
+        }
+        if (w->kv) {
+            kvstore_status budget = kvstore_enforce_budget(w->kv);
+            if (budget != KVSTORE_OK && budget != KVSTORE_BUDGET) {
+                kvstore_close(w->kv); w->kv = NULL; w->kv_open_status = budget;
+            }
+        }
     }
     *out = w;
     return RUNTIME_OK;
@@ -664,6 +679,17 @@ static void runtime_ckpt_reset(runtime *w) {
     w->ckpt_autosave_off = 0;
 }
 
+static int runtime_checkpoint_eligible(const kvstore_id *id, void *context) {
+    const conversation *c = context;
+    uint64_t epoch = conversation_epoch_current(c);
+    for (uint64_t i = 0; i < conversation_event_count(c); i++) {
+        const conversation_event *ev = conversation_event_at(c, i);
+        if (ev->type == CONVERSATION_EVENT_SNAPSHOT_REF && ev->epoch == epoch &&
+            !memcmp(ev->snapshot.bytes, id->bytes, sizeof id->bytes)) return 1;
+    }
+    return 0;
+}
+
 static void runtime_checkpoint_now(runtime *w, runtime_checkpoint_report *out) {
     runtime_checkpoint_report report;
     memset(&report, 0, sizeof report);
@@ -700,6 +726,8 @@ static void runtime_checkpoint_now(runtime *w, runtime_checkpoint_report *out) {
     kvstore_save_options options;
     memset(&options, 0, sizeof options);
     options.rebuild_cost = (uint64_t)position;
+    options.has_group = 1;
+    memcpy(options.group.bytes, w->current_id.bytes, 16);
     kvstore_id id;
     xe_snapshot_status snapshot_status;
     kvstore_status ks = kvstore_save(w->kv, w->session, &options, &id,
@@ -719,10 +747,13 @@ static void runtime_checkpoint_now(runtime *w, runtime_checkpoint_report *out) {
     if (conversation_append_snapshot_ref(c, &id, (uint64_t)position)
             != CONVERSATION_OK ||
         conversation_commit(c) != CONVERSATION_OK) {
+        kvstore_remove(w->kv, &id);
         out->reason = RUNTIME_CKPT_RECORD_FAILED;
         runtime_ckpt_backoff(w, now);
         return;
     }
+    /* Durable transcript reference is the commit point for pruning old points. */
+    kvstore_committed(w->kv, &id, w->session, runtime_checkpoint_eligible, c);
     w->saved_tokens = (uint64_t)position;
     w->saved_at = now;
     runtime_ckpt_reset(w);
@@ -786,6 +817,14 @@ static void runtime_scan_call_ids(runtime *w, conversation *c) {
     w->next_call_id = next;
 }
 
+static runtime_status runtime_best_snapshot(runtime *w, conversation *c, uint64_t limit,
+                                             kvstore_id *id, uint64_t *boundary) {
+    uint64_t cursor = UINT64_MAX; *boundary = limit;
+    while (w->kv && conversation_snapshot_previous(c, id, boundary, &cursor))
+        if (kvstore_contains(w->kv, id) == KVSTORE_OK) return RUNTIME_OK;
+    return RUNTIME_SESSION_NOT_FOUND;
+}
+
 static void runtime_open_report_fill(runtime *w, runtime_open_report *out) {
     conversation *c = w->current;
     uint64_t tokens;
@@ -797,7 +836,7 @@ static void runtime_open_report_fill(runtime *w, runtime_open_report *out) {
     out->turn_open = runtime_turn(c) == PROFILE_TURN_OPEN;
     kvstore_id snapshot;
     uint64_t boundary = 0;
-    int has_snapshot = conversation_snapshot_current(c, &snapshot, &boundary);
+    int has_snapshot = runtime_best_snapshot(w, c, tokens, &snapshot, &boundary) == RUNTIME_OK;
     out->zero_prefill = has_snapshot && boundary == tokens && tokens > 0;
     out->resume_stale = has_snapshot && !out->zero_prefill && boundary > 0;
     out->pending_calls = conversation_unknown_tool_calls(c, NULL, 0);
@@ -845,7 +884,7 @@ runtime_status runtime_session_open(runtime *w, const conversation_id *id,
     runtime_scan_call_ids(w, c);
     kvstore_id snapshot;
     uint64_t boundary = 0;
-    w->saved_tokens = conversation_snapshot_current(c, &snapshot, &boundary)
+    w->saved_tokens = runtime_best_snapshot(w, c, tokens, &snapshot, &boundary) == RUNTIME_OK
                       ? boundary : 0;
     w->saved_at = 0;
     runtime_ckpt_reset(w);
@@ -1197,27 +1236,6 @@ static void runtime_utf8_feed(runtime *w, const uint8_t *data, size_t length) {
     }
 }
 
-static runtime_status runtime_best_snapshot(conversation *c, uint64_t limit,
-                                      kvstore_id *id, uint64_t *boundary) {
-    uint64_t best = 0;
-    int found = 0;
-    uint64_t epoch = conversation_epoch_current(c);
-    uint64_t count = conversation_event_count(c);
-    for (uint64_t i = 0; i < count; i++) {
-        const conversation_event *ev = conversation_event_at(c, i);
-        if (ev->type != CONVERSATION_EVENT_SNAPSHOT_REF) continue;
-        if (ev->epoch != epoch) continue;
-        if (ev->snapshot_boundary > limit) continue;
-        if (ev->snapshot_boundary < best) continue;
-        best = ev->snapshot_boundary;
-        *id = ev->snapshot;
-        found = 1;
-    }
-    if (!found) return RUNTIME_SESSION_NOT_FOUND;
-    *boundary = best;
-    return RUNTIME_OK;
-}
-
 static runtime_status runtime_gen_prepare(runtime *w, xe_session *session,
                                     conversation *c) {
     w->gen_session = session;
@@ -1227,9 +1245,8 @@ static runtime_status runtime_gen_prepare(runtime *w, xe_session *session,
     int common = xe_session_common(session, &prompt);
     if (c && w->kv) {
         kvstore_id id;
-        uint64_t boundary = 0;
-        if (runtime_best_snapshot(c, (uint64_t)w->prompt_length, &id,
-                               &boundary) == RUNTIME_OK &&
+        uint64_t boundary = (uint64_t)w->prompt_length, cursor = UINT64_MAX;
+        while (conversation_snapshot_previous(c, &id, &boundary, &cursor) &&
             boundary > (uint64_t)common) {
             xe_tokens expected = { w->prompt, (int)boundary,
                                    (int)boundary };
@@ -1243,6 +1260,7 @@ static runtime_status runtime_gen_prepare(runtime *w, xe_session *session,
                 common = xe_session_common(session, &prompt);
                 w->resume.loaded = 1;
                 w->resume.reason = RUNTIME_RESUME_LOADED;
+                break;
             } else if (ks == KVSTORE_MISS) {
                 w->resume.reason = RUNTIME_RESUME_EVICTED;
             } else if (ks == KVSTORE_REJECTED) {
@@ -1259,6 +1277,7 @@ static runtime_status runtime_gen_prepare(runtime *w, xe_session *session,
             } else {
                 w->resume.reason = RUNTIME_RESUME_IO;
             }
+            common = xe_session_common(session, &prompt);
         }
     }
     w->inference.prefill.total = (uint64_t)(w->prompt_length - common);
@@ -2140,7 +2159,7 @@ runtime_status runtime_rewind_cost(runtime *w, runtime_marker marker,
     }
     kvstore_id id;
     uint64_t snapshot_boundary = 0;
-    if (runtime_best_snapshot(c, boundary, &id, &snapshot_boundary)
+    if (runtime_best_snapshot(w, c, boundary, &id, &snapshot_boundary)
             == RUNTIME_OK) {
         *prefill_tokens = boundary - snapshot_boundary;
         return RUNTIME_OK;
