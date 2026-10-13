@@ -613,7 +613,8 @@ int main(int argc, char **argv) {
         /* Transport bound alone: a 1.5 MiB line within the token budget
          * (byte-heavy, token-cheap filler) is accepted, not dropped. */
         size_t filler = 1536 * 1024;
-        char *append = malloc(filler + 128);
+        size_t append_capacity = filler + 128;
+        char *append = malloc(append_capacity);
         CHECK(append != NULL);
         if (append) {
             size_t n = (size_t)snprintf(append, 128,
@@ -621,7 +622,7 @@ int main(int argc, char **argv) {
             for (size_t i = 0; i < filler; i++)
                 append[n + i] = (i % 32 == 0) ? 'x' : ' ';
             n += filler;
-            n += (size_t)snprintf(append + n, 128, "\"}\n");
+            n += (size_t)snprintf(append + n, append_capacity - n, "\"}\n");
             (void)n;
             CHECK(client_call(&big, "{\"op\":\"create\",\"system\":\"F\"}\n",
                               line, sizeof line));
