@@ -1,10 +1,18 @@
 #define _POSIX_C_SOURCE 200809L
+#if defined(__APPLE__)
+#define _DARWIN_C_SOURCE 1
+#endif
 
 #include "format.h"
 
 #include <limits.h>
 #include <pthread.h>
+#include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
+#if defined(__linux__) && !defined(XE_NO_OPENSSL)
+#include <dlfcn.h>
+#endif
 
 void format_put_u16le(uint8_t *p, uint16_t v) {
     p[0] = (uint8_t)v;
@@ -209,6 +217,92 @@ void format_sha256_bytes(const void *data, size_t len, uint8_t out[32]) {
     format_sha256_init(&s);
     format_sha256_update(&s, data, len);
     format_sha256_final(&s, out);
+}
+
+#if defined(__linux__) && !defined(XE_NO_OPENSSL)
+/* Opaque OpenSSL 3 API: loading it is optional and needs no development headers.
+ * Keep our successful dlopen reference alive while the function is callable. */
+typedef struct ossl_lib_ctx_st format_ossl_lib_ctx;
+typedef int (*format_ossl_digest_fn)(format_ossl_lib_ctx *, const char *,
+    const char *, const void *, size_t, unsigned char *, size_t *);
+static pthread_once_t format_openssl_once = PTHREAD_ONCE_INIT;
+static void *format_openssl_library;
+static format_ossl_digest_fn format_openssl_digest;
+
+static void format_openssl_init(void) {
+    void *library = dlopen("libcrypto.so.3", RTLD_NOW | RTLD_LOCAL);
+    if (!library) return;
+    void *symbol = dlsym(library, "EVP_Q_digest");
+    if (!symbol || sizeof symbol != sizeof format_openssl_digest) {
+        dlclose(library);
+        return;
+    }
+    memcpy(&format_openssl_digest, &symbol, sizeof format_openssl_digest);
+    format_openssl_library = library;
+}
+#endif
+
+format_sha256_backend format_sha256_bytes_fast(const void *data, size_t len,
+                                               uint8_t out[32]) {
+    const char *mode = getenv("XENOLITH_WEIGHTS_VERIFY");
+    if (mode && !strcmp(mode, "metadata")) return FORMAT_SHA256_DISABLED;
+#if defined(__linux__) && !defined(XE_NO_OPENSSL)
+    pthread_once(&format_openssl_once, format_openssl_init);
+    if (format_openssl_library && format_openssl_digest) {
+        /* EVP_Q_digest accepts an EVP_MAX_MD_SIZE (64-byte) buffer. */
+        uint8_t digest[64];
+        size_t size = 0;
+        if (format_openssl_digest(NULL, "SHA256", NULL, data, len,
+                                  digest, &size) == 1 && size == 32) {
+            memcpy(out, digest, 32);
+            return FORMAT_SHA256_OPENSSL;
+        }
+        return FORMAT_SHA256_FAILED;
+    }
+#endif
+    (void)data; (void)len; (void)out;
+    return FORMAT_SHA256_UNAVAILABLE;
+}
+
+void format_weights_metadata_hash(const void *header, size_t header_len,
+                                  size_t file_size, uint8_t out[32]) {
+    format_sha256 hash; format_sha256_init(&hash);
+    const char domain[] = "xenolith-model-v2";
+    uint8_t sizes[16];
+    format_put_u64le(sizes, file_size);
+    format_put_u64le(sizes + 8, header_len);
+    format_sha256_update(&hash, domain, sizeof domain - 1);
+    format_sha256_update(&hash, sizes, sizeof sizes);
+    format_sha256_update(&hash, header, header_len);
+    format_sha256_final(&hash, out);
+}
+
+void format_weights_file_identity(const struct stat *info, uint8_t out[32]) {
+    uint8_t data[7 * 8];
+    format_put_u64le(data, (uint64_t)info->st_dev);
+    format_put_u64le(data + 8, (uint64_t)info->st_ino);
+    format_put_u64le(data + 16, (uint64_t)info->st_size);
+#if defined(__APPLE__)
+    format_put_u64le(data + 24, (uint64_t)info->st_mtimespec.tv_sec);
+    format_put_u64le(data + 32, (uint64_t)info->st_mtimespec.tv_nsec);
+    format_put_u64le(data + 40, (uint64_t)info->st_ctimespec.tv_sec);
+    format_put_u64le(data + 48, (uint64_t)info->st_ctimespec.tv_nsec);
+#else
+    format_put_u64le(data + 24, (uint64_t)info->st_mtim.tv_sec);
+    format_put_u64le(data + 32, (uint64_t)info->st_mtim.tv_nsec);
+    format_put_u64le(data + 40, (uint64_t)info->st_ctim.tv_sec);
+    format_put_u64le(data + 48, (uint64_t)info->st_ctim.tv_nsec);
+#endif
+    format_sha256_bytes(data, sizeof data, out);
+}
+
+void format_weights_verification_warning(format_sha256_backend reason,
+                                          const char *artifact) {
+    const char *why = reason == FORMAT_SHA256_FAILED ? "OpenSSL SHA-256 failed" :
+        reason == FORMAT_SHA256_DISABLED ? "OpenSSL SHA-256 disabled by XENOLITH_WEIGHTS_VERIFY" :
+        "OpenSSL 3 could not be loaded";
+    fprintf(stderr, "xenolith: warning: %s for %s; using metadata-only weight checks, "
+                    "without full content verification.\n", why, artifact);
 }
 
 int format_read(FILE *f, void *data, size_t len) {

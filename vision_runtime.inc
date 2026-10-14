@@ -233,8 +233,7 @@ static runtime_status runtime_visual_collect(runtime *w,conversation *c) {
                boundary<previous||(uint64_t)offset+meta.rows>boundary-previous)
                 return runtime_fail(w,RUNTIME_INVALID_ARGUMENT,"invalid image layout");
             const uint8_t *p=block->data;
-            if(memcmp(p+144,xe_engine_vision_fingerprint(w->engine),32)||
-               memcmp(p+176,xe_engine_model_fingerprint(w->engine),32))
+            if(!xe_engine_vision_artifacts_match(w->engine, p+176, p+144))
                 return runtime_fail(w,RUNTIME_INVALID_ARGUMENT,"image model mismatch; rebuild required");
             runtime_visual_asset *asset;runtime_status status=runtime_visual_asset_get(w,&meta,media,size,p,&asset);
             if(status!=RUNTIME_OK)return status;

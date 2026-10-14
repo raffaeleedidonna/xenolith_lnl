@@ -232,6 +232,9 @@ struct xe_engine {
     size_t map_len;
     int map_fd;
     const void *data;
+    size_t tensor_directory_pos;
+    uint8_t model_file_identity[32];
+    int model_content_verified;
     size_t header_len;   /* bytes before the tensor data section: metadata + tensor directory */
     uint32_t gguf_version;
     char *name;
@@ -3321,6 +3324,7 @@ static xe_engine *xe_map_file(const char *gguf_path) {
     e->map = map;
     e->map_len = (size_t)st.st_size;
     e->map_fd = fd;
+    format_weights_file_identity(&st, e->model_file_identity);
     e->bos_id = e->eos_id = e->eot_id = e->unk_id = e->pad_id = -1;
 
     return e;
@@ -3906,6 +3910,7 @@ static xe_engine *xe_open_common(const char *gguf_path, int vocab_only, xe_cur *
     e->scalar_rms = 1;
     *c = xe_parse_header(e, gguf_path);
     xe_parse_metadata(e, c, gguf_path);
+    e->tensor_directory_pos = c->pos;
     xe_tok_build(e, gguf_path);
     if (vocab_only) {
         close(e->map_fd);

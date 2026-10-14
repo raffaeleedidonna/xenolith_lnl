@@ -217,7 +217,7 @@ The conversation retains original image bytes, preprocessing metadata and
 model fingerprints, so deleting the original file or derived embedding cache
 does not lose the image. Derived embeddings live in `CACHE/vision-v1`, with
 a 2 GiB eviction budget. Their identity includes content, resized pixels,
-budget, both weight hashes, source/compiler/SPIR-V fingerprints, GPU identity,
+budget, both weight fingerprints, source/compiler/SPIR-V fingerprints, GPU identity,
 driver version and the compiled native GPU module. Visual KV snapshots bind
 the complete mixed input and numerical fingerprint. A mismatch triggers replay;
 a missing or corrupt source is an explicit error. Old model artifacts require
@@ -477,3 +477,9 @@ terminal event. Optional reports may also be absent on older engines.
 The external protocol is implemented in [serve.c](serve.c); [runtime.h](runtime.h)
 defines the C orchestration API behind it. The `wire` CLI command and socket
 name remain unchanged by the internal rename to `runtime`.
+
+With OpenSSL unavailable or failed, the engine warns and performs metadata-only
+weight checks rather than a generic full-file SHA-256 scan. Visual numerical
+identity binds this policy and file identity (including mtime/ctime) separately
+from full-content verification. Existing image media can be replayed across
+policy changes; embeddings and KV snapshots cannot cross-reuse computations.

@@ -62,6 +62,9 @@ int xe_engine_encode_image(xe_engine *e, const xe_image *image, float *output,
                             const char *dump_directory);
 const uint8_t *xe_engine_model_fingerprint(xe_engine *e);
 const uint8_t *xe_engine_vision_fingerprint(const xe_engine *e);
+int xe_engine_vision_artifacts_match(const xe_engine *e,
+                                    const uint8_t model_id[32],
+                                    const uint8_t projector_id[32]);
 int xe_engine_vision_numeric_fingerprint(xe_engine *e, uint8_t out[32]);
 int xe_session_set_text_prefill(xe_session *s, int rows);
 int xe_session_sync_input(xe_session *s, const xe_input *input);

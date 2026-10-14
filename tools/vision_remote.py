@@ -19,4 +19,5 @@ if not a.python:
 encoded = base64.b64encode(source).decode()
 remote = (f'wsl.exe -d {a.distribution} -- python3 -c '
           f'"import base64;exec(base64.b64decode(\'{encoded}\'))"')
-raise SystemExit(subprocess.run(["ssh", "-S", a.socket, a.host, remote]).returncode)
+raise SystemExit(subprocess.run(["ssh", "-o", "BatchMode=yes", "-S", a.socket,
+                                a.host, remote]).returncode)

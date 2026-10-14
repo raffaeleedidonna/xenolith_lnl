@@ -55,7 +55,12 @@ typedef struct {
     xe_vision_tensor *tensors;
     size_t tensor_count;
     uint8_t sha256[32];
+    int content_verified; /* sha256 identifies full content, otherwise GGUF metadata */
+    uint8_t file_identity[32];
 } xe_vision_model;
+
+int xe_vision_weights_fingerprint_matches(const uint8_t id[32], int projector,
+                                          int content_verified);
 
 int xe_image_size(int width, int height, int budget, int *out_width, int *out_height);
 int xe_image_load(xe_image *out, const char *path, int budget,

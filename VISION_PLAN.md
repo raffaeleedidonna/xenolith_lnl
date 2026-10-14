@@ -261,10 +261,14 @@ rispetto alla baseline separatamente dalla correttezza rispetto al riferimento.
 Benchmark pp512/pp2048/pp8192, tg128, prefill testuale 512 contro 1024, vision
 a tutti i budget, latenza primo token, throughput e memoria/residenza WSL.
 
-Pesi e riferimenti sono bloccati in `vision/manifest.json`. Il loader verifica dimensione e SHA-256 del mmproj; l'abilitazione vision
-verifica anche il SHA-256 completo del modello linguistico. Questo hash viene
-calcolato una volta per engine e non modifica il percorso testuale. I valori
-reali di entrambi i file sono già stati verificati sulla macchina target.
+Pesi e riferimenti sono bloccati in `vision/manifest.json`, incluse le impronte
+del solo header per il fallback. Con OpenSSL 3 disponibile il loader verifica
+SHA-256 completo di modello e mmproj. Se la libreria manca o fallisce, avvisa
+e usa controlli rapidi su header, metadati e schema, come richiesto dall’utente;
+questa modalità non verifica i valori dei tensori. Nessuna scansione SHA-256 C
+completa viene eseguita come fallback. Le cache distinguono la modalità e,
+nel fallback, l’identità del file tramite inode/device e timestamp mtime/ctime.
+I media restano riutilizzabili per replay dopo un cambio di modalità.
 
 ## Stato dell'implementazione
 

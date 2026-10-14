@@ -427,16 +427,31 @@ void xe_vision_model_close(xe_vision_model *m) {
     free(m->tensors);memset(m,0,sizeof *m);
 }
 
+/* Metadata pins use the pre-vision MODEL v2 fingerprint: header + size.
+ * This checks compatibility, not tensor contents. Both pins identify the same
+ * supported artifacts; numeric/cache identity separately binds verification. */
+int xe_vision_weights_fingerprint_matches(const uint8_t id[32], int projector,
+                                          int content_verified) {
+    static const uint8_t pins[2][2][32] = {
+        { {0xd9,0x46,0x5e,0x49,0xed,0xd7,0xe2,0xc2,0x00,0x35,0xf9,0xbd,0xc4,0x6f,0x65,0x9b,0x59,0xa5,0xdf,0x0d,0xa9,0xf8,0xc4,0xea,0xd3,0x4a,0xcd,0xe0,0x70,0xfd,0x2e,0x8d}, {0xa7,0xc5,0xbc,0x71,0x5f,0x5f,0xf8,0xe9,0x9a,0x3e,0x89,0x01,0xce,0x7d,0x2b,0x42,0xb4,0x02,0xc6,0x69,0xbf,0x24,0xf7,0xc5,0x25,0x07,0x47,0x63,0x3d,0x0f,0x58,0x91} },
+        { {0x48,0xc9,0x55,0xdf,0x85,0x84,0xa2,0x5e,0x94,0xf0,0xde,0xb0,0x5c,0x93,0x94,0xe3,0xba,0x24,0x78,0x4d,0xb1,0xa3,0x4d,0xbc,0xba,0x51,0xc6,0xfd,0x43,0x54,0x8d,0x30}, {0xd0,0x0f,0x21,0x1a,0x7d,0x4f,0x7f,0xb1,0x9b,0xd9,0xb7,0x5d,0x8e,0x93,0x42,0xec,0xcf,0xfb,0x59,0x20,0xb0,0x8f,0xd9,0x56,0x21,0x67,0x56,0x0f,0xdf,0xcc,0x5d,0xd1} }
+    };
+    return id && !memcmp(id, pins[!!projector][!!content_verified], 32);
+}
+
 int xe_vision_model_open(xe_vision_model *m,const char *path,char *error,size_t cap) {
-    static const uint8_t expected[32]={0xd0,0x0f,0x21,0x1a,0x7d,0x4f,0x7f,0xb1,0x9b,0xd9,0xb7,0x5d,0x8e,0x93,0x42,0xec,0xcf,0xfb,0x59,0x20,0xb0,0x8f,0xd9,0x56,0x21,0x67,0x56,0x0f,0xdf,0xcc,0x5d,0xd1};
     if(!m||!path)return fail(error,cap,"invalid mmproj argument");
     memset(m,0,sizeof *m);int fd=open(path,O_RDONLY);struct stat st;
     if(fd<0)return fail(error,cap,"cannot open mmproj");
     if(fstat(fd,&st)||st.st_size!=INT64_C(1193058784)){close(fd);return fail(error,cap,"mmproj size mismatch");}
     m->mapping_size=(size_t)st.st_size;m->mapping=mmap(NULL,m->mapping_size,PROT_READ,MAP_PRIVATE,fd,0);close(fd);
     if(m->mapping==MAP_FAILED){m->mapping=NULL;return fail(error,cap,"cannot map mmproj");}
-    format_sha256_bytes(m->mapping,m->mapping_size,m->sha256);
-    if(memcmp(expected,m->sha256,32))goto bad;
+    format_weights_file_identity(&st, m->file_identity);
+    format_sha256_backend backend = format_sha256_bytes_fast(m->mapping,m->mapping_size,m->sha256);
+    m->content_verified = backend == FORMAT_SHA256_OPENSSL;
+    if (m->content_verified) {
+        if (!xe_vision_weights_fingerprint_matches(m->sha256, 1, 1)) goto bad;
+    } else format_weights_verification_warning(backend, "mmproj");
     cursor c={m->mapping,(const uint8_t *)m->mapping+m->mapping_size,0};
     if(u32(&c)!=UINT32_C(0x46554747)||u32(&c)!=3)goto bad;
     uint64_t nt=u64(&c),nk=u64(&c);if(nt!=356||nk>4096)goto bad;
@@ -464,6 +479,10 @@ int xe_vision_model_open(xe_vision_model *m,const char *path,char *error,size_t 
     }
     uint64_t offset;if(c.bad||!format_align_u64((uint64_t)(c.p-(const uint8_t *)m->mapping),alignment,&offset)||offset>m->mapping_size)goto bad;
     m->data_offset=(size_t)offset;
+    if (!m->content_verified) {
+        format_weights_metadata_hash(m->mapping, m->data_offset, m->mapping_size, m->sha256);
+        if (!xe_vision_weights_fingerprint_matches(m->sha256, 1, 0)) goto bad;
+    }
     for(size_t i=0;i<m->tensor_count;i++) {
         xe_vision_tensor *t=m->tensors+i;
         if(t->offset%alignment||t->offset>m->mapping_size-offset||t->bytes>m->mapping_size-offset-t->offset)goto bad;

@@ -89,3 +89,6 @@
 tests/test_vision_session
 
 /tests/test_text_batch_model
+
+/tests/test_sha256_fast
+/tests/test_weights_identity

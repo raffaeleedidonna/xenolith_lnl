@@ -16,7 +16,7 @@ and writes by the valid row count.
 The canonical image identity is SHA-256 over a domain/version tag, SHA-256 of
 original encoded bytes, SHA-256 of decoded RGB pixels plus width/height,
 preprocessing revision (EXIF transpose, alpha composited on white, HF budget geometry, Pillow bicubic), requested budget, resized-pixel SHA-256, actual resized dimensions, valid
-output count, SHA-256 of all text model bytes, mmproj SHA-256 and numeric encoder revision.
+output count, text-model and mmproj fingerprints, and numeric encoder revision.
 Integers use unsigned little-endian encoding and strings use a length prefix.
 The visual identity hashes projected F32 embedding bytes in little-endian order.
 The computed-input hash also hashes the media, budget and embedding bytes,
@@ -51,7 +51,7 @@ requires re-encoding and a new identity.
 
 Visual KV snapshots use version 2 of `XENXKV`: the six existing KV sections
 are unchanged. Header flag at byte 24 is 1, bytes 320..351 contain the complete
-computed-input hash, and MODEL binds all language-model bytes. Loading requires
+computed-input hash, and MODEL binds the selected language-model fingerprint. Loading requires
 `xe_session_snapshot_load_input` and the matching mixed input. Token-only
 load rejects these snapshots. Text snapshots still use version 1. Checkpointing
 a COW shadow is rejected; promote it before saving.
@@ -61,7 +61,7 @@ the text block in user messages and tool results. `XEVIMG1\n` records contain a
 288-byte little-endian header followed by original encoded media. The header
 stores the span offset within that message's rendered tokens, rows, budget,
 original/resized geometry, media length, source/RGB/resized hashes, visual
-identity, mmproj/model hashes and numerical fingerprint. Reserved bytes must
+identity, mmproj/model fingerprints and numerical fingerprint. Reserved bytes must
 be zero. Blocks are authoritative media; embeddings are separate derived data.
 Projection recomputes absolute span offsets from visible message boundaries,
 including after reasoning is discarded, rewind and rebuild.
@@ -85,3 +85,18 @@ The opt-in wire protocol v2 exposes images, media references and retrieval;
 see [PROTOCOL.md](../PROTOCOL.md). Protocol v1 remains text-only. Runtime visual
 replay is synchronous; its asynchronous shadow prefill optimization is disabled
 for visual prompts. Core shadow/COW and promotion still support owned images.
+
+Weight verification defaults to full SHA-256 through the optional OpenSSL 3
+library on Linux. If unavailable or unsuccessful, the loader warns and uses
+the pre-vision MODEL v2 fingerprint (complete header/tensor directory plus file
+size), compared with metadata pins in the manifest. It does not hash all tensor
+bytes using the generic C implementation. Tensor payload changes with unchanged
+metadata can therefore pass this fallback policy. It can be selected explicitly
+with `XENOLITH_WEIGHTS_VERIFY=metadata` for diagnostics.
+
+The visual numerical fingerprint v3 binds verification mode separately for
+model and projector. In metadata mode it also binds each mapped file's device,
+inode, size, mtime and ctime with nanoseconds; access time is excluded. Metadata
+and full-content caches/snapshots never cross-reuse computations. Persisted image
+records may identify the same pinned artifacts by either known fingerprint,
+so retained media remain usable for re-encoding/replay across policy changes.

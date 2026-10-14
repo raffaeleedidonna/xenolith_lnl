@@ -10,7 +10,8 @@ NUMERIC_CFLAGS_HASH=$(shell printf '%s' '$(BASE_CFLAGS)' | sha256sum | cut -d' '
 CFLAGS=$(BASE_CFLAGS) -DXE_BUILD_COMMIT='"$(BUILD_COMMIT)"' \
 	-DXE_NUMERIC_SOURCE_HASH='"$(NUMERIC_SOURCE_HASH)"' \
 	-DXE_NUMERIC_CFLAGS_HASH='"$(NUMERIC_CFLAGS_HASH)"'
-LDLIBS=-lm -lze_loader
+FORMAT_LDLIBS=$(if $(filter Linux,$(shell uname -s)),-ldl)
+LDLIBS=-lm -lze_loader $(FORMAT_LDLIBS)
 
 GPU_SPV=xenolith_gpu.spv
 GPU_OBJ=xenolith_gpu_spv.o
@@ -45,7 +46,7 @@ clean:
 		bench/bench_guard bench/compare_pp_tg_xe bench/compare_pp_tg_tokens \
 		bench/bench_b3b.spv bench/bench_b3b_adlp.spv \
 		bench/bench_prefill_gemm bench/bench_prefill_gemm_down \
-		bench/bench_prefill_gemm.spv $(GPU_SPV) $(TEST_TOOLS) tests/test_vision_input tests/test_vision_gpu tests/test_vision_session tests/test_text_batch_model tools/vision_prepare
+		bench/bench_prefill_gemm.spv $(GPU_SPV) $(TEST_TOOLS) tests/test_vision_input tests/test_vision_gpu tests/test_vision_session tests/test_text_batch_model tools/vision_prepare tests/test_sha256_fast tests/test_weights_identity
 
 $(GPU_SPV): xenolith.cl vision.cl
 	# Xe-LP is the SPIR-V feature baseline; native code is compiled at startup.
@@ -65,7 +66,7 @@ LLAMA_LDLIBS=-lllama -lggml -lggml-base
 
 TEST_CFLAGS=-O2 -std=c11 -Wall -Wextra -pthread
 
-UNIT_TESTS=tests/test_inference tests/test_format tests/test_json tests/test_decode tests/test_conversation tests/test_gpu_alloc tests/test_context_limits
+UNIT_TESTS=tests/test_inference tests/test_format tests/test_sha256_fast tests/test_json tests/test_decode tests/test_conversation tests/test_gpu_alloc tests/test_context_limits
 GPU_TESTS=tests/test_kv tests/test_snapshot tests/test_kvstore tests/test_prefill_session
 PERSISTENCE_TESTS=tests/test_snapshot_model tests/test_conversation_model tests/test_session_sync
 PREFILL_TESTS=tests/test_prefill_projection tests/test_prefill_qkv tests/test_prefill_swa \
@@ -107,7 +108,10 @@ check-context: tests/test_cli_context
 	./tests/test_cli_context
 
 tests/test_format: tests/test_format.c format.o format.h
-	$(CC) $(TEST_CFLAGS) -I. -o $@ tests/test_format.c format.o -pthread
+	$(CC) $(TEST_CFLAGS) -I. -o $@ tests/test_format.c format.o -pthread $(FORMAT_LDLIBS)
+
+tests/test_sha256_fast: tests/test_sha256_fast.c format.o format.h
+	$(CC) $(TEST_CFLAGS) -I. -o $@ $< format.o $(FORMAT_LDLIBS)
 
 tests/test_json: tests/test_json.c json.o json.h
 	$(CC) $(TEST_CFLAGS) -I. -o $@ tests/test_json.c json.o -pthread -lm
@@ -339,10 +343,10 @@ vision.o: vision.c vision.h format.h vendor/stb/stb_image.h
 	$(CC) $(CFLAGS) -c vision.c -o $@
 
 tests/test_vision_input: tests/test_vision_input.c vision.o format.o
-	$(CC) $(TEST_CFLAGS) -o $@ $^ -lm
+	$(CC) $(TEST_CFLAGS) -o $@ $^ -lm $(FORMAT_LDLIBS)
 
 tools/vision_prepare: tools/vision_prepare.c vision.o format.o
-	$(CC) $(TEST_CFLAGS) -o $@ $^ -lm
+	$(CC) $(TEST_CFLAGS) -o $@ $^ -lm $(FORMAT_LDLIBS)
 
 tests/test_vision_gpu: tests/test_vision_gpu.c xenolith.c xenolith.h vision_gpu.inc vision.o format.o $(GPU_OBJ)
 	$(CC) $(CFLAGS) -I. -o $@ $< vision.o format.o $(GPU_OBJ) $(LDLIBS)
@@ -356,3 +360,6 @@ tests/test_vision_session: tests/test_vision_session.c xenolith.c xenolith.h vis
 
 tests/test_text_batch_model: tests/test_text_batch_model.c xenolith.o xenolith.h format.o vision.o $(GPU_OBJ)
 	$(CC) $(CFLAGS) -I. -o $@ $< xenolith.o format.o vision.o $(GPU_OBJ) $(LDLIBS)
+
+tests/test_weights_identity: tests/test_weights_identity.c xenolith.c xenolith.h format.h $(NUMERIC_SOURCES) vision.o format.o $(GPU_OBJ)
+	$(CC) $(CFLAGS) -I. -o $@ $< vision.o format.o $(GPU_OBJ) $(LDLIBS)

@@ -250,6 +250,60 @@ sono raccolti nel [report](results/chat-kitten.json). Due turni sul JPEG reale
 del gattino e due turni testuali passano; i 143 controlli dei parametri passano.
 Il log conferma una sola esecuzione dell’encoder per la conversazione visuale.
 
+## Verifica pesi accelerata e fallback rapido
+
+L’aggiornamento successivo al commit `a7f7e68` usa l’API `EVP_Q_digest` della
+libreria OpenSSL 3 già disponibile su Linux, caricata opzionalmente senza
+richiedere header di sviluppo. Il risultato viene confrontato con gli SHA-256
+completi fissati nel manifesto; il confronto OpenSSL/C appartiene ai test e
+non viene ripetuto durante l’avvio dell’applicazione.
+
+Come richiesto dall’utente, se la libreria manca o il calcolo fallisce il loader
+avvisa e usa header, metadati, directory tensori e dimensione del file. Non
+ripiega sulla scansione C completa dei tensori. Le impronte rapide sono quelle
+dello schema MODEL v2 precedente alla vision e sono ora bloccate nel manifesto:
+header del modello 15.824.000 byte, header mmproj 22.816 byte. Questa modalità
+controlla compatibilità e struttura; modifiche ai soli valori dei tensori con
+metadati invariati possono passare. `XENOLITH_WEIGHTS_VERIFY=metadata` consente
+la verifica esplicita di questo fallback, sempre con avviso.
+
+La prova sulla stessa foto del gattino riporta questi tempi singoli:
+
+| Fase | Prima | OpenSSL | Solo metadati |
+|---|---:|---:|---:|
+| Apertura modello e verifica | 35,587 s | 4,021 s | 0,141 s |
+| mmproj, verifica e inizializzazione | 3,775 s | 0,741 s | 0,522 s |
+| Encoder | 17,706 s | 17,282 s | 19,182 s |
+| Prova completa con due domande | 67,651 s | 31,408 s | 41,219 s |
+
+Il tempo totale comprende anche caricamento/repack del modello linguistico,
+prefill e due risposte; non misura il solo tempo al primo prompt. Le prove
+sono singole, senza stima della variabilità o controllo dello stato iniziale
+della cache disco. Il fallback evita il costo della scansione C; il suo tempo
+totale non è risultato minore della prova OpenSSL. I costi rimanenti di
+caricamento e calcolo richiedono misure separate.
+
+Sono passati i test dei digest esatti, bordi di blocco, input disallineati e
+inizializzazione concorrente, inclusi simbolo EVP assente, funzione fallita,
+lunghezza digest errata e ASan/UBSan. La selezione del fallback su un buffer
+inaccessibile di lunghezza massima dimostra che non viene letto come file
+completo. Un test su pagina COW privata rileva una modifica ai tensori con
+SHA completo e verifica che i soli metadati la accettino; i metadati corrotti
+sono rifiutati in entrambe le modalità. Gli artefatti originali restano intatti.
+
+Le suite host/context/GPU/vision passano. Gli embedding a 70 sono identici
+byte per byte al riferimento numerico precedente in entrambe le modalità;
+i quattro dump testuali 64k/128k restano identici alla baseline pre-vision.
+Le due chat riconoscono il gatto e descrivono il mantello.
+
+Il fingerprint visuale v3 lega la modalità di verifica e, nel fallback, anche
+inode/device, dimensione e mtime/ctime. Il test su una sessione persistente
+full → metadata → metadata → full mantiene l’immagine e la risposta. I due
+cambi di modalità ricostruiscono il contesto; il riavvio nella stessa modalità
+metadata carica lo snapshot. I media persistenti rimangono utilizzabili;
+embedding e KV incompatibili non vengono riusati. Campioni, log e checksum
+sono nel [report](results/openssl-startup.json).
+
 ## Riproduzione
 
 Sul target Linux/Level Zero, con il modello già disponibile:

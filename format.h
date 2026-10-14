@@ -29,6 +29,23 @@ void format_sha256_init(format_sha256 *s);
 void format_sha256_update(format_sha256 *s, const void *data, size_t len);
 void format_sha256_final(format_sha256 *s, uint8_t out[32]);
 void format_sha256_bytes(const void *data, size_t len, uint8_t out[32]);
+typedef enum {
+    FORMAT_SHA256_UNAVAILABLE,
+    FORMAT_SHA256_OPENSSL,
+    FORMAT_SHA256_FAILED,
+    FORMAT_SHA256_DISABLED
+} format_sha256_backend;
+/* Full-content SHA-256 only when OpenSSL succeeds; otherwise leaves out intact.
+ * Never falls back to an expensive generic full-file scan. Weight loaders then
+ * warn and use metadata checks. XENOLITH_WEIGHTS_VERIFY=metadata forces that path. */
+format_sha256_backend format_sha256_bytes_fast(const void *data, size_t len,
+                                               uint8_t out[32]);
+void format_weights_metadata_hash(const void *header, size_t header_len,
+                                  size_t file_size, uint8_t out[32]);
+struct stat;
+void format_weights_file_identity(const struct stat *info, uint8_t out[32]);
+void format_weights_verification_warning(format_sha256_backend reason,
+                                          const char *artifact);
 
 int format_read(FILE *f, void *data, size_t len);
 int format_write(FILE *f, const void *data, size_t len);

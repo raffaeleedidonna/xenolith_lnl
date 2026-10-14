@@ -131,8 +131,20 @@ rows depends on aspect ratio. EXIF orientation is applied and alpha is
 composited on white. Limits are 64 MiB encoded and 32 million decoded pixels
 per image. The first CLI implementation releases encoder allocations before
 loading the language model. High budgets still have substantial encoder cost.
-Startup verifies complete model and projector hashes; it is separate from
-encoder and prefill timings printed on stderr.
+On Linux, startup uses the optional OpenSSL 3 `libcrypto.so.3` library to
+verify complete model and projector SHA-256 hashes. No OpenSSL development
+headers are required. If loading OpenSSL or computing the digest fails, the
+loader prints a warning and uses the pre-vision-style header/metadata checks,
+without scanning all tensor bytes with the generic C hash. That fallback checks
+compatibility, not full tensor-content integrity. Encoder and prefill timings
+are separate from verification and loading.
+
+`XENOLITH_WEIGHTS_VERIFY=metadata` explicitly selects the fast metadata policy
+for diagnostics and fallback tests, with a warning. Both policies validate file
+size, GGUF metadata and tensor schema against the pinned artifact definitions.
+Computed caches bind the policy; metadata-mode caches also bind inode/device
+and modification/status-change timestamps. Persisted media can be replayed
+when verification mode changes.
 
 `--prefill 512|1024` selects the text batch size for `run` and `bench`; 512
 remains the default. Visual spans are processed whole regardless of that text
