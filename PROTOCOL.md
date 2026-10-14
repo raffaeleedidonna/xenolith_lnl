@@ -19,8 +19,11 @@ Or use stdin for requests and stdout for replies:
 ./xenolith wire /path/to/model.gguf
 ```
 
-Both commands accept `--state DIR` and `--cache DIR`. `serve` also accepts
-`--idle-shutdown MINUTES`, a positive number; by default it stays running.
+Both commands accept `--state DIR`, `--cache DIR` and `--cache-budget SIZE`
+(default `16GiB`). The budget accepts integer bytes or a `B`, `kB`, `MB`, `GB`,
+`KiB`, `MiB` or `GiB` suffix; `0` disables disk cache reads and writes without
+removing existing files. `serve` also accepts `--idle-shutdown MINUTES`, a
+positive number; by default it stays running.
 Use absolute directory paths; the parent of an explicit socket path must exist.
 Without `--socket`, the socket is `$XDG_RUNTIME_DIR/xenolith/wire.sock` when
 available, otherwise `wire.sock` inside the state directory. Default state and
@@ -326,9 +329,24 @@ An explicit checkpoint reply, or optional `done.checkpoint`, contains `saved`,
 `saved: false` is a checkpoint outcome, not a failed generation. The durable
 transcript remains the source of truth; a later request may need to recompute KV.
 
+Checkpoints share global KV data and are recycled within the configured budget.
+The least recently used conversation is first reduced to an earlier reserve;
+if more space is needed, its remaining cache is removed. Transcripts are kept.
+Existing points of the conversation being saved stay protected until the new
+checkpoint and its reference are durable. If it cannot fit, saving is skipped
+with reason `budget` and those points are preserved.
+
 Optional `done.resume` contains `loaded`, `tokens`, and `reason` when loading
 failed: `evicted`, `model_mismatch`, `token_mismatch`, `io` or `rejected`.
-Its token count is the snapshot boundary loaded or attempted.
+Its token count is the snapshot boundary loaded or attempted. If the latest
+point is missing or rejected, restoration tries earlier compatible points in
+the current cache epoch before rebuilding. Resuming an earlier point requires
+prefill for the remaining transcript.
+
+Compatible v1 snapshots from `68b8fbf55` remain readable without conversion,
+subject to matching build and numerical settings; other v1 producers remain
+unsupported. Incompatible cache falls back to prefill. Older engines cannot
+read the new checkpoint format.
 
 ## History and rewinding
 

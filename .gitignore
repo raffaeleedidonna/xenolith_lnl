@@ -77,3 +77,6 @@
 /xenolith-wire-ecore-bench
 
 /tests/test_inference
+
+/tests/test_cache_policy
+/tests/test_cache_model

@@ -220,6 +220,9 @@ typedef struct {
     runtime_marker marker;
 } runtime_history_entry;
 
+runtime_status runtime_open_with_budget(runtime **out, xe_engine *engine,
+                                        const char *state_dir, const char *cache_dir,
+                                        uint64_t cache_budget);
 runtime_status runtime_open(runtime **out, xe_engine *engine, const char *state_dir,
                       const char *cache_dir);
 void runtime_close(runtime *w);

@@ -95,6 +95,8 @@ int main(int argc, char **argv) {
 
     kvstore_save_options options;
     memset(&options, 0, sizeof options);
+    options.has_group = 1;
+    memcpy(options.group.bytes, id.bytes, 16);
     kvstore_id snapshot64;
     xe_snapshot_status core;
     ok &= kvstore_save(cache, session, &options, &snapshot64, &core) ==
@@ -174,6 +176,38 @@ int main(int argc, char **argv) {
     int zero_ok = ok;
     printf("conversation-model: zero-prefill current-kv resume %s\n",
            zero_ok ? "PASS" : "FAIL");
+
+    char snapshot_path[4096], hex[33];
+    kvstore_id_format(&snapshot65, hex);
+    snprintf(snapshot_path, sizeof snapshot_path, "%s/%s.xkv", cache_dir, hex);
+    int corrupt = open(snapshot_path, O_RDWR);
+    ok &= corrupt >= 0;
+    if (corrupt >= 0) {
+        off_t end = lseek(corrupt, -1, SEEK_END);
+        unsigned char byte;
+        ok &= end >= 0 && pread(corrupt, &byte, 1, end) == 1;
+        byte ^= 1;
+        ok &= pwrite(corrupt, &byte, 1, end) == 1;
+        close(corrupt);
+    }
+    xe_session_reset(session);
+    counters_reset();
+    ok &= conversation_resume(resumed, cache, session, &report) == CONVERSATION_OK;
+    ok &= report.used_snapshot == 1 && report.boundary == 64;
+    ok &= xe_test_prefill_batches == 0 && xe_test_decode_tokens == 1;
+    ok &= memcmp(xe_session_logits(session), logits65, XE_VOCAB * sizeof(*logits65)) == 0;
+    printf("conversation-model: corrupt latest falls back without full prefill %s\n", ok ? "PASS" : "FAIL");
+
+    /* Eviction of the latest point must fall back to the preceding point,
+     * paying only the missing suffix instead of rebuilding the whole prompt. */
+    ok &= kvstore_remove(cache, &snapshot65) == KVSTORE_OK;
+    xe_session_reset(session);
+    counters_reset();
+    ok &= conversation_resume(resumed, cache, session, &report) == CONVERSATION_OK;
+    ok &= report.used_snapshot == 1 && report.zero_prefill == 0 && report.boundary == 64;
+    ok &= xe_test_prefill_batches == 0 && xe_test_decode_tokens == 1;
+    ok &= memcmp(xe_session_logits(session), logits65, XE_VOCAB * sizeof(*logits65)) == 0;
+    printf("conversation-model: evicted latest falls back with one-token continuation %s\n", ok ? "PASS" : "FAIL");
 
     int32_t greedy_live = 0;
     {
