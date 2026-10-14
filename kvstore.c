@@ -622,8 +622,8 @@ kvstore_status kvstore_save(kvstore *store, xe_session *session,
     return KVSTORE_OK;
 }
 
-kvstore_status kvstore_load(kvstore *store, const kvstore_id *id,
-                            xe_session *session, const xe_tokens *expected,
+static kvstore_status kvstore_load_impl(kvstore *store, const kvstore_id *id,
+                            xe_session *session, const xe_tokens *expected, const xe_input *mixed,
                             xe_snapshot_status *snapshot_status) {
     if (snapshot_status) *snapshot_status = XE_SNAPSHOT_OK;
     if (!store || !id || !session || !expected)
@@ -644,7 +644,8 @@ kvstore_status kvstore_load(kvstore *store, const kvstore_id *id,
         close(fd);
         return KVSTORE_IO;
     }
-    xe_snapshot_status core = xe_session_snapshot_load(session, file, expected);
+    xe_snapshot_status core = mixed ? xe_session_snapshot_load_input(session,file,mixed) :
+                              xe_session_snapshot_load(session,file,expected);
     int close_ok = fclose(file) == 0;
     if (snapshot_status) *snapshot_status = core;
     if (!close_ok) return KVSTORE_IO;
@@ -661,6 +662,18 @@ kvstore_status kvstore_load(kvstore *store, const kvstore_id *id,
     meta.last_hit = kvstore_now_ns();
     kvstore_meta_write(store, &meta, 0);
     return KVSTORE_OK;
+}
+
+kvstore_status kvstore_load(kvstore *store,const kvstore_id *id,xe_session *session,
+                            const xe_tokens *expected,xe_snapshot_status *status) {
+    return kvstore_load_impl(store,id,session,expected,NULL,status);
+}
+
+kvstore_status kvstore_load_input(kvstore *store,const kvstore_id *id,xe_session *session,
+                                  const xe_input *input,xe_snapshot_status *status) {
+    if(!input){if(status)*status=XE_SNAPSHOT_INVALID_ARGUMENT;return KVSTORE_INVALID_ARGUMENT;}
+    xe_tokens expected={(int32_t *)input->tokens,input->count,input->count};
+    return kvstore_load_impl(store,id,session,&expected,input,status);
 }
 
 kvstore_status kvstore_find(kvstore *store, const uint8_t key[32],

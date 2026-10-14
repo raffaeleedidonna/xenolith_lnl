@@ -6,6 +6,12 @@
 #include "xenolith_internal.h"
 
 #include <stdarg.h>
+#include <math.h>
+#include <dirent.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -34,12 +40,30 @@ typedef struct {
     uint32_t token_count;
 } runtime_render_copy;
 
+typedef struct {
+    uint8_t key[32],identity[32];
+    float *embeddings;
+    uint8_t *media;
+    size_t media_size;
+    int rows,budget;
+    uint64_t epoch;
+} runtime_visual_asset;
+
 struct runtime {
     xe_engine *engine;
     profile *prof;
     conversation_store *cstore;
     kvstore *kv;
     int context;
+    char vision_cache_dir[4096];
+    uint8_t vision_numeric[32];
+    int vision_numeric_ready;
+    int vision_touched;
+    runtime_visual_asset **vision_assets;
+    size_t vision_asset_count,vision_asset_capacity;
+    uint64_t vision_epoch;
+    xe_visual_span *visual;
+    size_t visual_count,visual_capacity;
 
     conversation *current;
     conversation_id current_id;
@@ -120,6 +144,10 @@ struct runtime {
     json_writer calls_scratch;
 };
 
+static void runtime_shadow_drop(runtime *w);
+static uint32_t runtime_turn(const conversation *c);
+static const char *runtime_tool_name_of(conversation *c,uint64_t call_id);
+static runtime_status runtime_budget_check(runtime *w,uint64_t total);
 static void runtime_settings_defaults(conversation_settings *settings);
 static runtime_status runtime_project_mutation(runtime *w, conversation *c,
                                          int thinking, uint32_t history);
@@ -260,6 +288,8 @@ static int runtime_default_cache_dir(char *out, size_t cap) {
     return n > 0 && (size_t)n < cap;
 }
 
+#include "vision_runtime.inc"
+
 runtime_status runtime_open(runtime **out, xe_engine *engine, const char *state_dir,
                       const char *cache_dir) {
     if (!out || !engine) return RUNTIME_INVALID_ARGUMENT;
@@ -299,6 +329,8 @@ runtime_status runtime_open(runtime **out, xe_engine *engine, const char *state_
                                               KVSTORE_DEFAULT_BUDGET);
         if (w->kv_open_status != KVSTORE_OK) w->kv = NULL;
     }
+    int vision_path=snprintf(w->vision_cache_dir,sizeof w->vision_cache_dir,"%s/vision-v1",cache_dir?cache_dir:state_dir);
+    if(vision_path<0||(size_t)vision_path>=sizeof w->vision_cache_dir)w->vision_cache_dir[0]=0;
     *out = w;
     return RUNTIME_OK;
 }
@@ -425,6 +457,7 @@ static runtime_status runtime_shadow_tick(runtime *w) {
 
 static void runtime_shadow_begin(runtime *w) {
     runtime_shadow_drop(w);
+    if(w->visual_count)return; /* Keep visual replay synchronous in the first runtime version. */
     w->shadow = xe_session_shadow_new(w->session);
     if (!w->shadow) return;
     w->shadow_cooldown = 0;
@@ -439,7 +472,7 @@ static int runtime_shadow_promote_resume(runtime *w) {
     xe_tokens prefix = { (int32_t *)tokens, (int)count, (int)count };
     int position = xe_session_position(w->shadow);
     int split = xe_session_shadow_split(w->shadow);
-    if (position < split || xe_session_common(w->shadow, &prefix) != position)
+    if (position < split || runtime_visual_common(w,w->shadow,&prefix) != position)
         return 0;
     if (!xe_session_shadow_promote(w->session, w->shadow)) return 0;
     xe_session_free(w->shadow);
@@ -464,6 +497,7 @@ void runtime_close(runtime *w) {
     runtime_calls_reset(w);
     free(w->calls);
     free(w->prompt);
+    runtime_visual_release(w);
     json_writer_free(&w->content);
     json_writer_free(&w->reasoning);
     json_writer_free(&w->render);
@@ -479,6 +513,7 @@ runtime_status runtime_describe(runtime *w, runtime_info *out) {
     out->max_output = w->context;
     out->kvstore = w->kv != NULL;
     out->reasoning = 1;
+    out->vision = xe_engine_vision_fingerprint(w->engine)!=NULL && (w->context==65536||w->context==131072);
     return RUNTIME_OK;
 }
 
@@ -684,13 +719,14 @@ static void runtime_checkpoint_now(runtime *w, runtime_checkpoint_report *out) {
     int position = xe_session_position(w->session);
     if (position <= 0) { out->reason = RUNTIME_CKPT_EMPTY; return; }
     if ((uint64_t)position > total) { out->reason = RUNTIME_CKPT_KV_DIVERGED; return; }
+    if(w->vision_touched && runtime_visual_collect(w,c)!=RUNTIME_OK){out->reason=RUNTIME_CKPT_REJECTED;return;}
     xe_tokens full = { (int32_t *)tokens, (int)total, (int)total };
-    if (xe_session_common(w->session, &full) < position) {
+    if (runtime_visual_common(w,w->session,&full) < position) {
         out->reason = RUNTIME_CKPT_KV_DIVERGED;
         return;
     }
     if ((uint64_t)position < total) {
-        xe_session_sync(w->session, &full);
+        if(runtime_visual_sync(w,w->session,&full,NULL)!=RUNTIME_OK){out->reason=RUNTIME_CKPT_REJECTED;return;}
         position = (int)total;
     }
     if ((uint64_t)position <= w->saved_tokens) {
@@ -838,7 +874,11 @@ runtime_status runtime_session_open(runtime *w, const conversation_id *id,
         conversation_close(c);
         return runtime_context_error(w, tokens);
     }
+    if(runtime_visual_present(c)&&!runtime_visual_numeric(w)) {
+        conversation_close(c);return runtime_fail(w,RUNTIME_INVALID_ARGUMENT,"vision is not enabled");
+    }
     runtime_park(w, NULL);
+    w->visual_count=0;
     w->current = c;
     w->current_id = *id;
     w->has_current = 1;
@@ -933,9 +973,15 @@ runtime_status runtime_history_at(runtime *w, uint64_t position,
         out->text = ev->blocks[0].data;
         out->text_length = ev->blocks[0].length;
     }
-    if (ev->block_count > 1) {
+    if (ev->block_count > 1 && ev->blocks[1].format==CONVERSATION_BLOCK_JSON) {
         out->extra_json = ev->blocks[1].data;
         out->extra_length = ev->blocks[1].length;
+    }
+    for(uint32_t i=0;i<ev->block_count;i++)if(ev->blocks[i].format==CONVERSATION_BLOCK_IMAGE) {
+        xe_image meta;int offset;const uint8_t *media;size_t size;
+        if(!runtime_visual_payload(ev->blocks+i,&meta,&offset,&media,&size))
+            return runtime_fail(w,RUNTIME_INVALID_ARGUMENT,"invalid stored image");
+        out->image=media;out->image_length=size;out->image_budget=meta.budget;out->image_rows=meta.rows;
     }
     out->reasoning = (const char *)ev->reasoning;
     out->reasoning_length = ev->reasoning_length;
@@ -972,6 +1018,8 @@ runtime_status runtime_append(runtime *w, const runtime_message *message,
         return runtime_fail(w, RUNTIME_BUSY, "generation in progress");
     if (!w->has_current)
         return runtime_fail(w, RUNTIME_SESSION_NOT_FOUND, "no open session");
+    if(message->image||message->image_length)
+        return runtime_visual_append(w,message,out);
     conversation *c = w->current;
     uint64_t tokens;
     conversation_tokens(c, &tokens);
@@ -1224,7 +1272,7 @@ static runtime_status runtime_gen_prepare(runtime *w, xe_session *session,
     w->autosave_attempted = 0;
     w->resume_attempted = 0;
     xe_tokens prompt = { w->prompt, w->prompt_length, w->context };
-    int common = xe_session_common(session, &prompt);
+    int common = runtime_visual_common(w,session,&prompt);
     if (c && w->kv) {
         kvstore_id id;
         uint64_t boundary = 0;
@@ -1234,13 +1282,15 @@ static runtime_status runtime_gen_prepare(runtime *w, xe_session *session,
             xe_tokens expected = { w->prompt, (int)boundary,
                                    (int)boundary };
             xe_snapshot_status snapshot_status;
-            kvstore_status ks = kvstore_load(w->kv, &id, session, &expected,
-                                             &snapshot_status);
+            xe_input mixed=runtime_visual_input(w,expected.v,expected.len);
+            kvstore_status ks = w->visual_count?
+                kvstore_load_input(w->kv,&id,session,&mixed,&snapshot_status):
+                kvstore_load(w->kv,&id,session,&expected,&snapshot_status);
             w->resume_attempted = 1;
             memset(&w->resume, 0, sizeof w->resume);
             w->resume.tokens = boundary;
             if (ks == KVSTORE_OK) {
-                common = xe_session_common(session, &prompt);
+                common = runtime_visual_common(w,session,&prompt);
                 w->resume.loaded = 1;
                 w->resume.reason = RUNTIME_RESUME_LOADED;
             } else if (ks == KVSTORE_MISS) {
@@ -1343,6 +1393,8 @@ runtime_status runtime_generate(runtime *w, const runtime_gen_params *params) {
     w->framing_offset = (int)tokens;
     w->prompt_length = (int)(tokens + render.token_count);
 
+    status=runtime_visual_collect(w,c);
+    if(status!=RUNTIME_OK)return status;
     w->generation_id = conversation_event_count(c);
     conversation_generation generation = { w->generation_id, settings };
     status = runtime_from_conversation(
@@ -1375,7 +1427,7 @@ runtime_status runtime_generate(runtime *w, const runtime_gen_params *params) {
     return runtime_gen_prepare(w, w->session, c);
 }
 
-runtime_status runtime_ephemeral_generate(runtime *w, const char *system,
+static runtime_status runtime_ephemeral_generate_impl(runtime *w, const char *system,
                                     const profile_tool *tools,
                                     size_t tool_count,
                                     const runtime_message *messages,
@@ -1418,7 +1470,18 @@ runtime_status runtime_ephemeral_generate(runtime *w, const char *system,
     uint32_t turn = PROFILE_TURN_PADDED;
     for (size_t i = 0; i < count; i++) {
         const runtime_message *m = &messages[i];
-        switch (m->kind) {
+        if(m->image||m->image_length) {
+            const char *name=NULL;
+            if(m->kind==RUNTIME_MESSAGE_TOOL_RESULT) {
+                if(turn!=PROFILE_TURN_OPEN||!m->tool_name)return runtime_fail(w,RUNTIME_INVALID_ARGUMENT,"missing open tool call");
+                name=m->tool_name;
+            } else if(m->kind!=RUNTIME_MESSAGE_USER)return runtime_fail(w,RUNTIME_INVALID_ARGUMENT,"image role is not supported");
+            uint8_t *payload;size_t payload_size;uint32_t offset;runtime_visual_asset *asset;
+            status=runtime_visual_prepare(w,m,name,turn,(uint64_t)length,&render,&payload,&payload_size,&asset,&offset);
+            free(payload);if(status!=RUNTIME_OK)return status;
+            status=runtime_visual_push(w,asset,length+(int)offset);if(status!=RUNTIME_OK)return status;
+            if(!name)turn=PROFILE_TURN_PADDED;
+        } else switch (m->kind) {
         case RUNTIME_MESSAGE_USER:
             if (!m->text)
                 return runtime_fail(w, RUNTIME_INVALID_ARGUMENT, "missing text");
@@ -1497,6 +1560,24 @@ runtime_status runtime_ephemeral_generate(runtime *w, const char *system,
     if (!w->ephemeral) w->ephemeral = xe_session_new(w->engine);
     w->gen_kind = RUNTIME_GEN_EPHEMERAL;
     return runtime_gen_prepare(w, w->ephemeral, NULL);
+}
+
+runtime_status runtime_ephemeral_generate(runtime *w,const char *system,
+        const profile_tool *tools,size_t tool_count,const runtime_message *messages,
+        size_t count,const runtime_gen_params *params) {
+    if(!w)return RUNTIME_INVALID_ARGUMENT;
+    if(w->gen_kind!=RUNTIME_GEN_NONE)return runtime_fail(w,RUNTIME_BUSY,"generation in progress");
+    if(count&&!messages)return runtime_fail(w,RUNTIME_INVALID_ARGUMENT,"missing messages");
+    uint64_t media=0;
+    for(size_t i=0;i<count;i++) {
+        if(messages[i].image_length>RT_IMAGE_LIMIT)return runtime_fail(w,RUNTIME_INVALID_ARGUMENT,"invalid image bytes");
+        media+=messages[i].image_length;
+        if(media>RT_IMAGE_MEDIA_LIMIT)return runtime_fail(w,RUNTIME_INVALID_ARGUMENT,"image media limit exceeded");
+    }
+    runtime_visual_begin(w);
+    runtime_status status=runtime_ephemeral_generate_impl(w,system,tools,tool_count,messages,count,params);
+    if(status!=RUNTIME_OK){w->visual_count=0;w->vision_epoch++;}
+    runtime_visual_prune(w);return status;
 }
 
 runtime_status runtime_cancel(runtime *w) {
@@ -1737,6 +1818,10 @@ static runtime_status runtime_finalize(runtime *w, uint32_t runtime_stop_reason,
         if (status != RUNTIME_OK) return runtime_gen_error(w, status, out);
         uint64_t total;
         const int32_t *projected = conversation_tokens(c, &total);
+        if(w->vision_touched) {
+            status=runtime_visual_collect(w,c);
+            if(status!=RUNTIME_OK)return runtime_gen_error(w,status,out);
+        }
         w->usage.total = total;
         int open = record_stop == CONVERSATION_STOP_TOOL_CALLS ||
                    record_stop == CONVERSATION_STOP_LIMIT ||
@@ -1744,12 +1829,13 @@ static runtime_status runtime_finalize(runtime *w, uint32_t runtime_stop_reason,
         if (!open && w->session && w->gen_after_tool) {
             xe_tokens prefix = { (int32_t *)projected, (int)total,
                                  (int)total };
-            int common = xe_session_common(w->session, &prefix);
+            int common = runtime_visual_common(w,w->session,&prefix);
             int shadow_position = w->shadow
                                   ? xe_session_position(w->shadow) : 0;
             if (common > shadow_position) {
                 xe_sync_report report;
-                xe_session_sync_report(w->session, &prefix, &report);
+                status=runtime_visual_sync(w,w->session,&prefix,&report);
+                if(status!=RUNTIME_OK)return runtime_gen_error(w,status,out);
                 w->usage.input += (uint64_t)report.prefilled;
                 w->usage.replayed += (uint64_t)report.prefilled;
                 runtime_shadow_drop(w);
@@ -1806,7 +1892,8 @@ static runtime_status runtime_finalize(runtime *w, uint32_t runtime_stop_reason,
                 xe_tokens prefix = { (int32_t *)projected, (int)total,
                                      (int)total };
                 xe_sync_report report;
-                xe_session_sync_report(w->session, &prefix, &report);
+                status=runtime_visual_sync(w,w->session,&prefix,&report);
+                if(status!=RUNTIME_OK)return runtime_gen_error(w,status,out);
                 w->usage.input += (uint64_t)report.prefilled;
                 w->usage.replayed += (uint64_t)report.prefilled;
                 xe_session_anchor_clear(w->session);
@@ -1901,13 +1988,15 @@ static runtime_status runtime_next_event_impl(runtime *w, runtime_event *out) {
                                                   RUNTIME_INFERENCE_RUNNING, out);
             }
             int target = w->prompt_synced + RUNTIME_PREFILL_CHUNK;
+            target=runtime_visual_target(w,target);
             if (target > w->prompt_length) target = w->prompt_length;
             if (!w->first_sync_done || w->prompt_synced < w->prompt_length) {
                 runtime_shadow_wait(w, 1);
                 xe_tokens prefix = { w->prompt, target, w->context };
                 xe_sync_report report;
                 runtime_inference_begin(w, RUNTIME_INFERENCE_PREFILL);
-                xe_session_sync_report(w->gen_session, &prefix, &report);
+                runtime_status visual_status=runtime_visual_sync(w,w->gen_session,&prefix,&report);
+                if(visual_status!=RUNTIME_OK)return runtime_gen_error(w,visual_status,out);
                 runtime_inference_end(w);
                 if (!w->first_sync_done) {
                     w->usage.cache_read = (uint64_t)report.reused;
@@ -2023,7 +2112,10 @@ static runtime_status runtime_next_event_impl(runtime *w, runtime_event *out) {
         xe_tokens prefix = { w->prompt,
                              w->prompt_length + w->sampled_length,
                              w->context };
-        xe_session_sync(w->gen_session, &prefix);
+        if(w->vision_touched) {
+            if(!xe_session_sync_continuation(w->gen_session,&prefix,NULL))
+                return runtime_gen_error(w,runtime_fail(w,RUNTIME_INVALID_ARGUMENT,"invalid continuation"),out);
+        } else xe_session_sync(w->gen_session, &prefix);
 
         switch (event.kind) {
         case PROFILE_PARSE_REASONING:
@@ -2122,7 +2214,7 @@ runtime_status runtime_rewind_cost(runtime *w, runtime_marker marker,
         return runtime_fail(w, RUNTIME_MARKER_UNAVAILABLE,
                          "marker is not addressable");
     uint64_t boundary = conversation_visible_boundary(c, position);
-    if (w->session && boundary) {
+    if (w->session && boundary && !w->vision_touched) {
         uint64_t total;
         const int32_t *tokens = conversation_tokens(c, &total);
         if (boundary <= total) {
@@ -2159,6 +2251,8 @@ runtime_status runtime_rebuild(runtime *w, const char *system,
     if (!w->has_current)
         return runtime_fail(w, RUNTIME_SESSION_NOT_FOUND, "no open session");
     conversation *c = w->current;
+    runtime_visual_begin(w);
+    uint8_t *image_payload=NULL;
     runtime_shadow_drop(w);
     if (w->session) xe_session_anchor_clear(w->session);
     runtime_status status = runtime_from_conversation(
@@ -2181,21 +2275,30 @@ runtime_status runtime_rebuild(runtime *w, const char *system,
         blocks[0].format = CONVERSATION_BLOCK_TEXT;
         blocks[0].data = m->text ? m->text : "";
         blocks[0].length = m->text ? strlen(m->text) : 0;
+        if((m->image||m->image_length)&&m->kind!=RUNTIME_MESSAGE_USER&&m->kind!=RUNTIME_MESSAGE_TOOL_RESULT) {
+            status=runtime_fail(w,RUNTIME_INVALID_ARGUMENT,"image role is not supported");goto abort;
+        }
         switch (m->kind) {
         case RUNTIME_MESSAGE_USER:
-            if (!m->text) {
+            if (!m->text && !m->image_length) {
                 status = runtime_fail(w, RUNTIME_INVALID_ARGUMENT,
                                    "missing text");
                 goto abort;
             }
-            status = runtime_from_profile(
+            if(m->image||m->image_length) {
+                size_t image_size;uint32_t offset;
+                status=runtime_visual_media_budget(w,c,m->image_length);
+                if(status!=RUNTIME_OK)goto abort;
+                status=runtime_visual_prepare(w,m,NULL,turn,tokens,&render,&image_payload,&image_size,NULL,&offset);
+                if(status==RUNTIME_OK){blocks[1]=(conversation_block){CONVERSATION_BLOCK_IMAGE,image_payload,image_size};block_count=2;}
+            } else status = runtime_from_profile(
                 w, profile_render_user(w->prof, m->text, turn, &render));
             if (status != RUNTIME_OK) goto abort;
             status = runtime_budget_check(w, tokens + render.token_count);
             if (status != RUNTIME_OK) goto abort;
             status = runtime_from_conversation(
                 w, conversation_append_message(c, CONVERSATION_ROLE_USER,
-                                               blocks, 1, render.render,
+                                               blocks, block_count, render.render,
                                                render.render_length,
                                                render.tokens,
                                                render.token_count));
@@ -2309,7 +2412,7 @@ runtime_status runtime_rebuild(runtime *w, const char *system,
                                    "no open model turn for a tool result");
                 goto abort;
             }
-            if (!m->text) {
+            if (!m->text && !m->image_length) {
                 status = runtime_fail(w, RUNTIME_INVALID_ARGUMENT,
                                    "missing text");
                 goto abort;
@@ -2347,7 +2450,13 @@ runtime_status runtime_rebuild(runtime *w, const char *system,
                                    "unknown tool call");
                 goto abort;
             }
-            status = runtime_from_profile(
+            if(m->image||m->image_length) {
+                size_t image_size;uint32_t offset;
+                status=runtime_visual_media_budget(w,c,m->image_length);
+                if(status!=RUNTIME_OK)goto abort;
+                status=runtime_visual_prepare(w,m,name,turn,tokens,&render,&image_payload,&image_size,NULL,&offset);
+                if(status==RUNTIME_OK){blocks[1]=(conversation_block){CONVERSATION_BLOCK_IMAGE,image_payload,image_size};block_count=2;}
+            } else status = runtime_from_profile(
                 w, profile_render_tool_result(w->prof, name, m->text,
                                               &render));
             if (status != RUNTIME_OK) goto abort;
@@ -2357,7 +2466,7 @@ runtime_status runtime_rebuild(runtime *w, const char *system,
                                                   : CONVERSATION_TOOL_OK;
             status = runtime_from_conversation(
                 w, conversation_append_tool_result(
-                       c, call_id, tool_status, blocks, 1, render.render,
+                       c, call_id, tool_status, blocks, block_count, render.render,
                        render.render_length, render.tokens,
                        render.token_count));
             if (status != RUNTIME_OK) goto abort;
@@ -2368,7 +2477,9 @@ runtime_status runtime_rebuild(runtime *w, const char *system,
                                "unsupported message kind");
             goto abort;
         }
+        free(image_payload);image_payload=NULL;
     }
+    runtime_visual_prune(w);
     conversation_settings settings;
     if (!conversation_get_settings(c, &settings))
         runtime_settings_defaults(&settings);
@@ -2386,6 +2497,7 @@ runtime_status runtime_rebuild(runtime *w, const char *system,
     return RUNTIME_OK;
 
 abort:
+    free(image_payload);w->visual_count=0;w->vision_epoch++;runtime_visual_prune(w);
     {
         conversation_status rollback = conversation_rollback(c);
         if (rollback != CONVERSATION_OK)

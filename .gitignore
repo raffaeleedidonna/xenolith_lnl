@@ -77,3 +77,15 @@
 /xenolith-wire-ecore-bench
 
 /tests/test_inference
+
+/.vision-cache/
+/vision-runs/
+/vision/fixtures/*.rgb
+/tools/vision_prepare
+/tools/vision_reference
+/tests/test_vision_input
+/tests/test_vision_gpu
+
+tests/test_vision_session
+
+/tests/test_text_batch_model

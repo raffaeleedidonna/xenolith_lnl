@@ -2,6 +2,8 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "serve.h"
+#include "format.h"
+#include <math.h>
 #include "runtime.h"
 #include "json.h"
 
@@ -75,6 +77,7 @@ typedef struct {
     int stop;
     int accept_paused;
     int64_t idle_ms;
+    int protocol;
     size_t max_frame;        /* context_window * SERVE_FRAME_BYTES_PER_TOKEN */
     int64_t active_at;
     json_writer out;
@@ -465,6 +468,8 @@ static int serve_own(char ***owned, size_t *count, char *text) {
     return 1;
 }
 
+#include "vision_serve.inc"
+
 static int serve_tools_parse(const json_value *request, serve_tools *out) {
     memset(out, 0, sizeof *out);
     const json_value *array = json_member(request, "tools");
@@ -493,7 +498,7 @@ static int serve_tools_parse(const json_value *request, serve_tools *out) {
     return 1;
 }
 
-static int serve_messages_parse(const json_value *request,
+static int serve_messages_parse(serve *s,const json_value *request,
                                 serve_messages *out) {
     memset(out, 0, sizeof *out);
     const json_value *array = json_member(request, "messages");
@@ -516,6 +521,10 @@ static int serve_messages_parse(const json_value *request,
         const char *role = serve_str(v, "role");
         if (!role) return 0;
         m->text = serve_str(v, "text");
+        uint8_t *media;
+        if(!serve_image_parse(s,v,m,&media))return 0;
+        if(media&&!serve_own(&out->owned,&out->owned_count,(char *)media))return 0;
+        if(m->image&&(strcmp(role,"user")&&strcmp(role,"tool")&&strcmp(role,"tool_result")))return 0;
         if (!strcmp(role, "user")) {
             m->kind = RUNTIME_MESSAGE_USER;
         } else if (!strcmp(role, "assistant")) {
@@ -825,7 +834,7 @@ static int serve_dispatch(serve *s, serve_conn *c,
         }
         serve_ok_begin(s);
         json_raw(out, ",\"protocol\":");
-        json_i64(out, SERVE_PROTOCOL);
+        json_i64(out, s->protocol);
         json_raw(out, ",\"model\":");
         json_string(out, info.model, strlen(info.model));
         json_raw(out, ",\"context_window\":");
@@ -834,6 +843,7 @@ static int serve_dispatch(serve *s, serve_conn *c,
         json_i64(out, info.max_output);
         json_raw(out, ",\"max_frame\":");
         json_u64(out, (uint64_t)s->max_frame);
+        if(s->protocol==2)json_raw(out,",\"vision\":{\"formats\":[\"png\",\"jpeg\"],\"budgets\":[70,140,280,560,1120],\"default_budget\":280,\"max_bytes\":50331648,\"max_context_media_bytes\":268435456,\"media_refs\":true}");
         json_raw(out, ",\"kvstore\":");
         json_raw(out, info.kvstore ? "true" : "false");
         json_raw(out, ",\"reasoning\":{\"efforts\":[\"low\","
@@ -1007,8 +1017,13 @@ static int serve_dispatch(serve *s, serve_conn *c,
             serve_error(s, c, RUNTIME_INVALID_ARGUMENT, "invalid role");
             return 0;
         }
+        uint8_t *media;
+        if(!serve_image_parse(s,request,&message,&media)) {
+            serve_error(s,c,RUNTIME_INVALID_ARGUMENT,"invalid image data or reference");return 0;
+        }
         runtime_marker marker;
         status = runtime_append(s->w, &message, &marker);
+        free(media);
         if (status != RUNTIME_OK) {
             serve_runtime_error(s, c, status);
             return 0;
@@ -1042,7 +1057,7 @@ static int serve_dispatch(serve *s, serve_conn *c,
             serve_error(s, c, RUNTIME_INVALID_ARGUMENT, "invalid tools");
             return 0;
         }
-        if (!serve_messages_parse(request, &messages)) {
+        if (!serve_messages_parse(s,request, &messages)) {
             serve_tools_free(&tools);
             serve_messages_free(&messages);
             serve_error(s, c, RUNTIME_INVALID_ARGUMENT, "invalid messages");
@@ -1076,7 +1091,7 @@ static int serve_dispatch(serve *s, serve_conn *c,
             serve_error(s, c, RUNTIME_INVALID_ARGUMENT, "invalid tools");
             return 0;
         }
-        if (!serve_messages_parse(request, &messages)) {
+        if (!serve_messages_parse(s,request, &messages)) {
             serve_tools_free(&tools);
             serve_messages_free(&messages);
             serve_error(s, c, RUNTIME_INVALID_ARGUMENT, "invalid messages");
@@ -1165,6 +1180,25 @@ static int serve_dispatch(serve *s, serve_conn *c,
         serve_emit(s, c);
         return 0;
     }
+    if(!strcmp(op,"media")) {
+        const json_value *id=json_member(request,"image_id");uint8_t hash[32];const uint8_t *media;size_t size;
+        if(!id||id->type!=JSON_STRING||!serve_image_hex(id->text,id->text_length,hash)) {
+            serve_error(s,c,RUNTIME_INVALID_ARGUMENT,"invalid image reference");return 0;
+        }
+        status=runtime_media(s->w,hash,&media,&size);
+        if(status!=RUNTIME_OK){serve_runtime_error(s,c,status);return 0;}
+        size_t offset=0,limit=256*1024;
+        const json_value *v=json_member(request,"offset");
+        if(v){if(v->type!=JSON_NUMBER||!isfinite(v->number)||v->number<0||v->number>size||v->number!=floor(v->number)) {
+            serve_error(s,c,RUNTIME_INVALID_ARGUMENT,"invalid media offset");return 0;}offset=(size_t)v->number;}
+        v=json_member(request,"limit");
+        if(v){if(v->type!=JSON_NUMBER||!isfinite(v->number)||v->number<1||v->number>XE_IMAGE_RECORD_LIMIT||v->number!=floor(v->number)) {
+            serve_error(s,c,RUNTIME_INVALID_ARGUMENT,"invalid media limit");return 0;}limit=(size_t)v->number;}
+        if(limit>size-offset)limit=size-offset;
+        serve_ok_begin(s);json_raw(out,",\"offset\":");json_u64(out,offset);
+        json_raw(out,",\"total\":");json_u64(out,size);json_raw(out,",\"data\":");
+        serve_image_encode(out,media+offset,limit);json_raw(out,"}");serve_emit(s,c);return 0;
+    }
     if (!strcmp(op, "history")) {
         uint64_t count = runtime_history_count(s->w);
         serve_ok_begin(s);
@@ -1183,6 +1217,7 @@ static int serve_dispatch(serve *s, serve_conn *c,
             json_raw(out, ",\"text\":");
             json_string(out, entry.text ? entry.text : "",
                         entry.text_length);
+            if(entry.image)serve_image_description(out,&entry);
             if (entry.reasoning) {
                 json_raw(out, ",\"reasoning\":");
                 json_string(out, entry.reasoning,
@@ -1304,7 +1339,7 @@ static int serve_needs_session(const char *op) {
     return !strcmp(op, "append") || !strcmp(op, "generate") ||
            !strcmp(op, "rewind") || !strcmp(op, "rewind_cost") ||
            !strcmp(op, "rebuild") || !strcmp(op, "checkpoint") ||
-           !strcmp(op, "history") || !strcmp(op, "pending");
+           !strcmp(op, "history") || !strcmp(op, "pending") || !strcmp(op,"media");
 }
 
 static int serve_execute(serve *s, serve_conn *c,
@@ -1730,6 +1765,10 @@ static void serve_init(serve *s, const xe_engine *engine) {
     s->listen_fd = -1;
     s->max_frame = (size_t)xe_context_size(engine) *
                    SERVE_FRAME_BYTES_PER_TOKEN;
+    s->protocol=SERVE_PROTOCOL;
+    if(xe_engine_vision_fingerprint(engine) && (xe_context_size(engine)==65536||xe_context_size(engine)==131072)) {
+        s->protocol=2;s->max_frame=96*1024*1024;
+    }
     s->gen_owner = -1;
     for (int i = 0; i < SERVE_MAX_CONNECTIONS; i++) {
         s->conns[i].in_fd = -1;

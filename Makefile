@@ -4,7 +4,8 @@ $(error CTX is now a runtime option; use --ctx N when starting xenolith)
 endif
 BUILD_COMMIT=$(shell git rev-parse --short=9 HEAD 2>/dev/null || printf unknown)
 BASE_CFLAGS=-O3 -march=native -std=c11 -Wall -Wextra -pthread
-NUMERIC_SOURCE_HASH=$(shell sha256sum xenolith.c xenolith.cl | sha256sum | cut -d' ' -f1)
+NUMERIC_SOURCES=xenolith.c xenolith.cl vision.c vision.h vision_gpu.inc vision.cl vendor/stb/stb_image.h
+NUMERIC_SOURCE_HASH=$(shell sha256sum $(NUMERIC_SOURCES) | sha256sum | cut -d' ' -f1)
 NUMERIC_CFLAGS_HASH=$(shell printf '%s' '$(BASE_CFLAGS)' | sha256sum | cut -d' ' -f1)
 CFLAGS=$(BASE_CFLAGS) -DXE_BUILD_COMMIT='"$(BUILD_COMMIT)"' \
 	-DXE_NUMERIC_SOURCE_HASH='"$(NUMERIC_SOURCE_HASH)"' \
@@ -14,18 +15,19 @@ LDLIBS=-lm -lze_loader
 GPU_SPV=xenolith_gpu.spv
 GPU_OBJ=xenolith_gpu_spv.o
 
-xenolith: main.o xenolith.o format.o json.o profile.o kvstore.o conversation.o runtime.o serve.o $(GPU_OBJ)
-	$(CC) $(CFLAGS) -o $@ main.o xenolith.o format.o json.o profile.o kvstore.o conversation.o runtime.o serve.o $(GPU_OBJ) $(LDLIBS)
+xenolith: main.o xenolith.o format.o vision.o json.o profile.o kvstore.o conversation.o runtime.o serve.o $(GPU_OBJ)
+	$(CC) $(CFLAGS) -o $@ main.o xenolith.o format.o vision.o json.o profile.o kvstore.o conversation.o runtime.o serve.o $(GPU_OBJ) $(LDLIBS)
 
-main.o: main.c xenolith.h profile.h serve.h conversation.h kvstore.h
-xenolith.o: xenolith.c xenolith.cl xenolith.h xenolith_internal.h format.h
+main.o: main.c xenolith.h format.h profile.h serve.h conversation.h kvstore.h
+xenolith.o: $(NUMERIC_SOURCES) xenolith.h xenolith_internal.h format.h
 format.o: format.c format.h
 json.o: json.c json.h
 profile.o: profile.c profile.h xenolith.h format.h json.h
 kvstore.o: kvstore.c kvstore.h xenolith.h format.h
 conversation.o: conversation.c conversation.h kvstore.h xenolith.h format.h
-runtime.o: runtime.c runtime.h xenolith.h xenolith_internal.h kvstore.h conversation.h profile.h format.h json.h
-serve.o: serve.c serve.h runtime.h xenolith.h kvstore.h conversation.h profile.h json.h
+runtime.o: runtime.c runtime.h vision_runtime.inc xenolith.h xenolith_internal.h kvstore.h conversation.h profile.h format.h json.h
+serve.o: serve.c serve.h vision_serve.inc format.h runtime.h xenolith.h kvstore.h conversation.h profile.h json.h
+main.o profile.o kvstore.o conversation.o runtime.o serve.o: vision.h
 
 clean:
 	rm -f *.o xenolith tests/certify tests/test_kv tests/test_kv_model tests/test_decode tests/test_context_limits \
@@ -43,9 +45,9 @@ clean:
 		bench/bench_guard bench/compare_pp_tg_xe bench/compare_pp_tg_tokens \
 		bench/bench_b3b.spv bench/bench_b3b_adlp.spv \
 		bench/bench_prefill_gemm bench/bench_prefill_gemm_down \
-		bench/bench_prefill_gemm.spv $(GPU_SPV) $(TEST_TOOLS)
+		bench/bench_prefill_gemm.spv $(GPU_SPV) $(TEST_TOOLS) tests/test_vision_input tests/test_vision_gpu tests/test_vision_session tests/test_text_batch_model tools/vision_prepare
 
-$(GPU_SPV): xenolith.cl
+$(GPU_SPV): xenolith.cl vision.cl
 	# Xe-LP is the SPIR-V feature baseline; native code is compiled at startup.
 	ocloc compile -file $< -device xe-lp -spv_only -output xenolith_gpu \
 		-output_no_suffix -out_dir . -options '-cl-std=CL3.0' -q
@@ -73,12 +75,14 @@ ENGINE_TESTS=tests/test_snapshot tests/test_snapshot_model tests/test_kvstore \
 	tests/test_fixture_decode $(PREFILL_TESTS) tests/test_prefill_session_drop \
 	tests/test_prefill_session_safe tests/test_session_sync
 
-$(ENGINE_TESTS): xenolith_internal.h format.h
+tests/test_inference tests/test_context_limits: vision_runtime.inc vision_serve.inc
+
+$(ENGINE_TESTS) tests/test_context_limits tests/test_gpu_alloc: xenolith_internal.h format.h $(NUMERIC_SOURCES)
 tests/test_prefill_session tests/test_prefill_session_drop tests/test_prefill_session_safe \
     tests/test_kv_model tests/test_snapshot_model tests/test_session_sync tests/test_runtime_model \
     tests/test_conversation_model tests/test_serve_model: tests/test_context.h
-tests/test_runtime tests/test_runtime_model tests/test_serve: xenolith.h conversation.h kvstore.h profile.h json.h
-tests/test_serve: serve.h
+tests/test_runtime tests/test_runtime_model tests/test_serve: vision_runtime.inc xenolith.h conversation.h kvstore.h profile.h json.h
+tests/test_serve: serve.h vision_serve.inc
 tests/test_profile: json.h
 
 VOCAB_DIR=$(LLAMA_DIR)/models
@@ -86,8 +90,8 @@ MODEL?=
 GOLDEN_PROMPTS=short long mixed ws nl nlonly json
 ORACLE_PROMPTS=short long
 
-tests/certify: tests/certify.c xenolith.o format.o profile.o json.o xenolith.h profile.h $(GPU_OBJ)
-	$(CC) $(TEST_CFLAGS) -I. -o $@ tests/certify.c xenolith.o format.o profile.o json.o $(GPU_OBJ) $(LDLIBS)
+tests/certify: tests/certify.c xenolith.o format.o vision.o profile.o json.o xenolith.h profile.h $(GPU_OBJ)
+	$(CC) $(TEST_CFLAGS) -I. -o $@ tests/certify.c xenolith.o format.o vision.o profile.o json.o $(GPU_OBJ) $(LDLIBS)
 
 tests/test_gpu_alloc: tests/test_gpu_alloc.c xenolith.c xenolith.h xenolith_internal.h format.h
 	$(CC) $(CFLAGS) -ffunction-sections -fdata-sections -I. -o $@ $< \
@@ -96,8 +100,8 @@ tests/test_gpu_alloc: tests/test_gpu_alloc.c xenolith.c xenolith.h xenolith_inte
 tests/test_cli_context: tests/test_cli_context.c xenolith.h xenolith
 	$(CC) $(TEST_CFLAGS) -I. -o $@ $<
 
-tests/test_context_limits: tests/test_context_limits.c main.c xenolith.c xenolith.h xenolith_internal.h runtime.c runtime.h serve.c serve.h profile.o json.o conversation.o kvstore.o format.o $(GPU_OBJ)
-	$(CC) $(CFLAGS) -I. -o $@ $< profile.o json.o conversation.o kvstore.o format.o $(GPU_OBJ) $(LDLIBS)
+tests/test_context_limits: tests/test_context_limits.c main.c xenolith.c xenolith.h xenolith_internal.h runtime.c runtime.h serve.c serve.h profile.o json.o conversation.o kvstore.o format.o vision.o $(GPU_OBJ)
+	$(CC) $(CFLAGS) -I. -o $@ $< profile.o json.o conversation.o kvstore.o format.o vision.o $(GPU_OBJ) $(LDLIBS)
 
 check-context: tests/test_cli_context
 	./tests/test_cli_context
@@ -108,102 +112,102 @@ tests/test_format: tests/test_format.c format.o format.h
 tests/test_json: tests/test_json.c json.o json.h
 	$(CC) $(TEST_CFLAGS) -I. -o $@ tests/test_json.c json.o -pthread -lm
 
-tests/test_profile: tests/test_profile.c profile.o profile.h json.o format.o xenolith.o xenolith.h $(GPU_OBJ)
-	$(CC) $(CFLAGS) -I. -o $@ tests/test_profile.c profile.o json.o format.o xenolith.o $(GPU_OBJ) $(LDLIBS)
+tests/test_profile: tests/test_profile.c profile.o profile.h json.o format.o vision.o xenolith.o xenolith.h $(GPU_OBJ)
+	$(CC) $(CFLAGS) -I. -o $@ tests/test_profile.c profile.o json.o format.o vision.o xenolith.o $(GPU_OBJ) $(LDLIBS)
 
-tests/test_inference: tests/test_inference.c runtime.c runtime.h serve.c serve.h profile.o json.o conversation.o kvstore.o format.o xenolith.o $(GPU_OBJ)
-	$(CC) $(CFLAGS) -I. -o $@ tests/test_inference.c profile.o json.o conversation.o kvstore.o format.o xenolith.o $(GPU_OBJ) $(LDLIBS)
+tests/test_inference: tests/test_inference.c runtime.c runtime.h serve.c serve.h profile.o json.o conversation.o kvstore.o format.o vision.o xenolith.o $(GPU_OBJ)
+	$(CC) $(CFLAGS) -I. -o $@ tests/test_inference.c profile.o json.o conversation.o kvstore.o format.o vision.o xenolith.o $(GPU_OBJ) $(LDLIBS)
 
-tests/test_runtime: tests/test_runtime.c runtime.o runtime.h profile.o json.o conversation.o kvstore.o format.o xenolith.o $(GPU_OBJ)
-	$(CC) $(CFLAGS) -I. -o $@ tests/test_runtime.c runtime.o profile.o json.o conversation.o kvstore.o format.o xenolith.o $(GPU_OBJ) $(LDLIBS)
+tests/test_runtime: tests/test_runtime.c runtime.o runtime.h profile.o json.o conversation.o kvstore.o format.o vision.o xenolith.o $(GPU_OBJ)
+	$(CC) $(CFLAGS) -I. -o $@ tests/test_runtime.c runtime.o profile.o json.o conversation.o kvstore.o format.o vision.o xenolith.o $(GPU_OBJ) $(LDLIBS)
 
-tests/test_runtime_model: tests/test_runtime_model.c runtime.o runtime.h profile.o json.o conversation.o kvstore.o format.o xenolith.o $(GPU_OBJ)
-	$(CC) $(CFLAGS) -I. -o $@ tests/test_runtime_model.c runtime.o profile.o json.o conversation.o kvstore.o format.o xenolith.o $(GPU_OBJ) $(LDLIBS)
+tests/test_runtime_model: tests/test_runtime_model.c runtime.o runtime.h profile.o json.o conversation.o kvstore.o format.o vision.o xenolith.o $(GPU_OBJ)
+	$(CC) $(CFLAGS) -I. -o $@ tests/test_runtime_model.c runtime.o profile.o json.o conversation.o kvstore.o format.o vision.o xenolith.o $(GPU_OBJ) $(LDLIBS)
 
-tests/test_serve: tests/test_serve.c serve.o serve.h runtime.o runtime.h profile.o json.o conversation.o kvstore.o format.o xenolith.o $(GPU_OBJ)
-	$(CC) $(CFLAGS) -I. -o $@ tests/test_serve.c serve.o runtime.o profile.o json.o conversation.o kvstore.o format.o xenolith.o $(GPU_OBJ) $(LDLIBS)
+tests/test_serve: tests/test_serve.c serve.o serve.h runtime.o runtime.h profile.o json.o conversation.o kvstore.o format.o vision.o xenolith.o $(GPU_OBJ)
+	$(CC) $(CFLAGS) -I. -o $@ tests/test_serve.c serve.o runtime.o profile.o json.o conversation.o kvstore.o format.o vision.o xenolith.o $(GPU_OBJ) $(LDLIBS)
 
 tests/test_serve_model: tests/test_serve_model.c json.o json.h xenolith
 	$(CC) $(TEST_CFLAGS) -I. -o $@ tests/test_serve_model.c json.o -pthread -lm
 
-tests/test_snapshot: tests/test_snapshot.c xenolith.c xenolith.h format.o $(GPU_OBJ)
-	$(CC) $(CFLAGS) -I. -o $@ tests/test_snapshot.c format.o $(GPU_OBJ) $(LDLIBS)
+tests/test_snapshot: tests/test_snapshot.c xenolith.c xenolith.h format.o vision.o $(GPU_OBJ)
+	$(CC) $(CFLAGS) -I. -o $@ tests/test_snapshot.c format.o vision.o $(GPU_OBJ) $(LDLIBS)
 
-tests/test_snapshot_model: tests/test_snapshot_model.c xenolith.c xenolith.h format.o $(GPU_OBJ)
-	$(CC) $(CFLAGS) -I. -o $@ tests/test_snapshot_model.c format.o $(GPU_OBJ) $(LDLIBS)
+tests/test_snapshot_model: tests/test_snapshot_model.c xenolith.c xenolith.h format.o vision.o $(GPU_OBJ)
+	$(CC) $(CFLAGS) -I. -o $@ tests/test_snapshot_model.c format.o vision.o $(GPU_OBJ) $(LDLIBS)
 
-tests/test_kvstore: tests/test_kvstore.c xenolith.c xenolith.h kvstore.o kvstore.c kvstore.h format.o $(GPU_OBJ)
-	$(CC) $(CFLAGS) -I. -o $@ tests/test_kvstore.c kvstore.o format.o $(GPU_OBJ) $(LDLIBS)
+tests/test_kvstore: tests/test_kvstore.c xenolith.c xenolith.h kvstore.o kvstore.c kvstore.h format.o vision.o $(GPU_OBJ)
+	$(CC) $(CFLAGS) -I. -o $@ tests/test_kvstore.c kvstore.o format.o vision.o $(GPU_OBJ) $(LDLIBS)
 
-tests/test_conversation: tests/test_conversation.c conversation.o conversation.h kvstore.o kvstore.h xenolith.o xenolith.h format.o format.h $(GPU_OBJ)
-	$(CC) $(CFLAGS) -I. -o $@ tests/test_conversation.c conversation.o kvstore.o xenolith.o format.o $(GPU_OBJ) $(LDLIBS)
+tests/test_conversation: tests/test_conversation.c conversation.o conversation.h kvstore.o kvstore.h xenolith.o xenolith.h format.o vision.o format.h $(GPU_OBJ)
+	$(CC) $(CFLAGS) -I. -o $@ tests/test_conversation.c conversation.o kvstore.o xenolith.o format.o vision.o $(GPU_OBJ) $(LDLIBS)
 
-tests/test_conversation_model: tests/test_conversation_model.c xenolith.c xenolith.h conversation.o conversation.h kvstore.o kvstore.h format.o format.h $(GPU_OBJ)
-	$(CC) $(CFLAGS) -I. -o $@ tests/test_conversation_model.c conversation.o kvstore.o format.o $(GPU_OBJ) $(LDLIBS)
+tests/test_conversation_model: tests/test_conversation_model.c xenolith.c xenolith.h conversation.o conversation.h kvstore.o kvstore.h format.o vision.o format.h $(GPU_OBJ)
+	$(CC) $(CFLAGS) -I. -o $@ tests/test_conversation_model.c conversation.o kvstore.o format.o vision.o $(GPU_OBJ) $(LDLIBS)
 
-tests/test_kv: tests/test_kv.c xenolith.c xenolith.h format.o $(GPU_OBJ)
-	$(CC) $(CFLAGS) -I. -o $@ tests/test_kv.c format.o $(GPU_OBJ) $(LDLIBS)
+tests/test_kv: tests/test_kv.c xenolith.c xenolith.h format.o vision.o $(GPU_OBJ)
+	$(CC) $(CFLAGS) -I. -o $@ tests/test_kv.c format.o vision.o $(GPU_OBJ) $(LDLIBS)
 
-tests/test_decode: tests/test_decode.c xenolith.c xenolith.h format.o $(GPU_OBJ)
-	$(CC) $(CFLAGS) -I. -o $@ tests/test_decode.c format.o $(GPU_OBJ) $(LDLIBS)
+tests/test_decode: tests/test_decode.c xenolith.c xenolith.h format.o vision.o $(GPU_OBJ)
+	$(CC) $(CFLAGS) -I. -o $@ tests/test_decode.c format.o vision.o $(GPU_OBJ) $(LDLIBS)
 
-tests/test_model_decode: tests/test_model_decode.c xenolith.c xenolith.h format.o $(GPU_OBJ)
-	$(CC) $(CFLAGS) -I. -o $@ tests/test_model_decode.c format.o $(GPU_OBJ) $(LDLIBS)
+tests/test_model_decode: tests/test_model_decode.c xenolith.c xenolith.h format.o vision.o $(GPU_OBJ)
+	$(CC) $(CFLAGS) -I. -o $@ tests/test_model_decode.c format.o vision.o $(GPU_OBJ) $(LDLIBS)
 
-tests/test_kv_model: tests/test_kv_model.c xenolith.c xenolith.h format.o $(GPU_OBJ)
-	$(CC) $(CFLAGS) -I. -o $@ tests/test_kv_model.c format.o $(GPU_OBJ) $(LDLIBS)
+tests/test_kv_model: tests/test_kv_model.c xenolith.c xenolith.h format.o vision.o $(GPU_OBJ)
+	$(CC) $(CFLAGS) -I. -o $@ tests/test_kv_model.c format.o vision.o $(GPU_OBJ) $(LDLIBS)
 
-tests/test_prefill_projection: tests/test_prefill_projection.c xenolith.c xenolith.h format.o $(GPU_OBJ)
-	$(CC) $(CFLAGS) -I. -o $@ tests/test_prefill_projection.c format.o $(GPU_OBJ) $(LDLIBS)
+tests/test_prefill_projection: tests/test_prefill_projection.c xenolith.c xenolith.h format.o vision.o $(GPU_OBJ)
+	$(CC) $(CFLAGS) -I. -o $@ tests/test_prefill_projection.c format.o vision.o $(GPU_OBJ) $(LDLIBS)
 
-tests/test_prefill_qkv: tests/test_prefill_qkv.c xenolith.c xenolith.h format.o $(GPU_OBJ)
-	$(CC) $(CFLAGS) -I. -o $@ tests/test_prefill_qkv.c format.o $(GPU_OBJ) $(LDLIBS)
+tests/test_prefill_qkv: tests/test_prefill_qkv.c xenolith.c xenolith.h format.o vision.o $(GPU_OBJ)
+	$(CC) $(CFLAGS) -I. -o $@ tests/test_prefill_qkv.c format.o vision.o $(GPU_OBJ) $(LDLIBS)
 
-tests/test_prefill_swa: tests/test_prefill_swa.c xenolith.c xenolith.h format.o $(GPU_OBJ)
-	$(CC) $(CFLAGS) -I. -o $@ tests/test_prefill_swa.c format.o $(GPU_OBJ) $(LDLIBS)
+tests/test_prefill_swa: tests/test_prefill_swa.c xenolith.c xenolith.h format.o vision.o $(GPU_OBJ)
+	$(CC) $(CFLAGS) -I. -o $@ tests/test_prefill_swa.c format.o vision.o $(GPU_OBJ) $(LDLIBS)
 
-tests/test_prefill_dense: tests/test_prefill_dense.c xenolith.c xenolith.h format.o $(GPU_OBJ)
-	$(CC) $(CFLAGS) -I. -o $@ tests/test_prefill_dense.c format.o $(GPU_OBJ) $(LDLIBS)
+tests/test_prefill_dense: tests/test_prefill_dense.c xenolith.c xenolith.h format.o vision.o $(GPU_OBJ)
+	$(CC) $(CFLAGS) -I. -o $@ tests/test_prefill_dense.c format.o vision.o $(GPU_OBJ) $(LDLIBS)
 
-tests/test_prefill_layer: tests/test_prefill_layer.c xenolith.c xenolith.h format.o $(GPU_OBJ)
-	$(CC) $(CFLAGS) -I. -o $@ tests/test_prefill_layer.c format.o $(GPU_OBJ) $(LDLIBS)
+tests/test_prefill_layer: tests/test_prefill_layer.c xenolith.c xenolith.h format.o vision.o $(GPU_OBJ)
+	$(CC) $(CFLAGS) -I. -o $@ tests/test_prefill_layer.c format.o vision.o $(GPU_OBJ) $(LDLIBS)
 
-tests/test_prefill_session: tests/test_prefill_session.c xenolith.c xenolith.h format.o $(GPU_OBJ)
-	$(CC) $(CFLAGS) -I. -o $@ tests/test_prefill_session.c format.o $(GPU_OBJ) $(LDLIBS)
+tests/test_prefill_session: tests/test_prefill_session.c xenolith.c xenolith.h format.o vision.o $(GPU_OBJ)
+	$(CC) $(CFLAGS) -I. -o $@ tests/test_prefill_session.c format.o vision.o $(GPU_OBJ) $(LDLIBS)
 
-tests/test_prefill_session_drop: tests/test_prefill_session.c xenolith.c xenolith.h format.o $(GPU_OBJ)
-	$(CC) $(CFLAGS) -DXE_REPACK_DROP_SOURCE -I. -o $@ tests/test_prefill_session.c format.o $(GPU_OBJ) $(LDLIBS)
+tests/test_prefill_session_drop: tests/test_prefill_session.c xenolith.c xenolith.h format.o vision.o $(GPU_OBJ)
+	$(CC) $(CFLAGS) -DXE_REPACK_DROP_SOURCE -I. -o $@ tests/test_prefill_session.c format.o vision.o $(GPU_OBJ) $(LDLIBS)
 
-tests/test_prefill_session_safe: tests/test_prefill_session.c xenolith.c xenolith.h format.o $(GPU_OBJ)
-	$(CC) $(CFLAGS) -DXE_REPACK_DROP_SOURCE -I. -o $@ tests/test_prefill_session.c format.o $(GPU_OBJ) $(LDLIBS)
+tests/test_prefill_session_safe: tests/test_prefill_session.c xenolith.c xenolith.h format.o vision.o $(GPU_OBJ)
+	$(CC) $(CFLAGS) -DXE_REPACK_DROP_SOURCE -I. -o $@ tests/test_prefill_session.c format.o vision.o $(GPU_OBJ) $(LDLIBS)
 
-tests/test_session_sync: tests/test_session_sync.c xenolith.c xenolith.h format.o $(GPU_OBJ)
-	$(CC) $(CFLAGS) -I. -o $@ tests/test_session_sync.c format.o $(GPU_OBJ) $(LDLIBS)
+tests/test_session_sync: tests/test_session_sync.c xenolith.c xenolith.h format.o vision.o $(GPU_OBJ)
+	$(CC) $(CFLAGS) -I. -o $@ tests/test_session_sync.c format.o vision.o $(GPU_OBJ) $(LDLIBS)
 
-bench/bench_decode: bench/bench_decode.c xenolith.c xenolith.h format.o $(GPU_OBJ)
-	$(CC) $(CFLAGS) -I. -o $@ bench/bench_decode.c format.o $(GPU_OBJ) $(LDLIBS)
+bench/bench_decode: bench/bench_decode.c xenolith.c xenolith.h format.o vision.o $(GPU_OBJ)
+	$(CC) $(CFLAGS) -I. -o $@ bench/bench_decode.c format.o vision.o $(GPU_OBJ) $(LDLIBS)
 
-bench/bench_attention: bench/bench_attention.c xenolith.c xenolith.h format.o $(GPU_OBJ)
-	$(CC) $(CFLAGS) -I. -o $@ bench/bench_attention.c format.o $(GPU_OBJ) $(LDLIBS)
+bench/bench_attention: bench/bench_attention.c xenolith.c xenolith.h format.o vision.o $(GPU_OBJ)
+	$(CC) $(CFLAGS) -I. -o $@ bench/bench_attention.c format.o vision.o $(GPU_OBJ) $(LDLIBS)
 
-bench/bench_tg: bench/bench_tg.c xenolith.c xenolith.h format.o $(GPU_OBJ)
-	$(CC) $(CFLAGS) -I. -o $@ bench/bench_tg.c format.o $(GPU_OBJ) $(LDLIBS)
+bench/bench_tg: bench/bench_tg.c xenolith.c xenolith.h format.o vision.o $(GPU_OBJ)
+	$(CC) $(CFLAGS) -I. -o $@ bench/bench_tg.c format.o vision.o $(GPU_OBJ) $(LDLIBS)
 
 bench/bench_guard: bench/bench_guard.c
 	$(CC) $(TEST_CFLAGS) -o $@ $<
 
-bench/compare_pp_tg_xe: bench/compare_pp_tg.c xenolith.o format.o $(GPU_OBJ)
-	$(CC) $(CFLAGS) -I. -o $@ bench/compare_pp_tg.c xenolith.o format.o $(GPU_OBJ) $(LDLIBS)
+bench/compare_pp_tg_xe: bench/compare_pp_tg.c xenolith.o format.o vision.o $(GPU_OBJ)
+	$(CC) $(CFLAGS) -I. -o $@ bench/compare_pp_tg.c xenolith.o format.o vision.o $(GPU_OBJ) $(LDLIBS)
 
 bench/compare_pp_tg_tokens: bench/compare_pp_tg_tokens.c
 	$(CC) $(BASE_CFLAGS) -o $@ $<
 
-bench/bench_b3b: bench/bench_b3b.c xenolith.c xenolith.h format.o $(GPU_OBJ)
-	$(CC) $(CFLAGS) -I. -o $@ bench/bench_b3b.c format.o $(GPU_OBJ) $(LDLIBS)
+bench/bench_b3b: bench/bench_b3b.c xenolith.c xenolith.h format.o vision.o $(GPU_OBJ)
+	$(CC) $(CFLAGS) -I. -o $@ bench/bench_b3b.c format.o vision.o $(GPU_OBJ) $(LDLIBS)
 
-bench/bench_b3b_8e: bench/bench_b3b.c xenolith.c xenolith.h format.o $(GPU_OBJ)
+bench/bench_b3b_8e: bench/bench_b3b.c xenolith.c xenolith.h format.o vision.o $(GPU_OBJ)
 	$(CC) $(CFLAGS) -DXE_WORKERS=8 -DXE_WORKER_ECORES -I. \
-		-o $@ bench/bench_b3b.c format.o $(GPU_OBJ) $(LDLIBS)
+		-o $@ bench/bench_b3b.c format.o vision.o $(GPU_OBJ) $(LDLIBS)
 
 bench/bench_b3b.spv: bench/bench_b3b.cl
 	ocloc compile -file $< -device xe-lp -spv_only -output bench_b3b \
@@ -228,8 +232,8 @@ bench/bench_prefill_gemm.spv: bench/bench_prefill_gemm.cl
 bench-prefill-gemm: bench/bench_prefill_gemm bench/bench_prefill_gemm_down \
 	bench/bench_prefill_gemm.spv
 
-tests/test_fixture_decode: tests/test_fixture_decode.c xenolith.c xenolith.h format.o $(GPU_OBJ)
-	$(CC) $(CFLAGS) -I. -o $@ tests/test_fixture_decode.c format.o $(GPU_OBJ) $(LDLIBS)
+tests/test_fixture_decode: tests/test_fixture_decode.c xenolith.c xenolith.h format.o vision.o $(GPU_OBJ)
+	$(CC) $(CFLAGS) -I. -o $@ tests/test_fixture_decode.c format.o vision.o $(GPU_OBJ) $(LDLIBS)
 
 check-kv: tests/test_kv
 	./tests/test_kv
@@ -329,4 +333,26 @@ require-model:
 
 .PHONY: require-model clean check check-inference check-unit check-gpu check-context check-persistence check-prefill check-all \
 	check-kv check-kv-edges check-kv-load-bounds check-runtime check-serve golden test-tools test-tools-clean \
-	bench-b3b bench-b14 bench-prefill-gemm
+	bench-b3b bench-b14 bench-prefill-gemm check-vision
+
+vision.o: vision.c vision.h format.h vendor/stb/stb_image.h
+	$(CC) $(CFLAGS) -c vision.c -o $@
+
+tests/test_vision_input: tests/test_vision_input.c vision.o format.o
+	$(CC) $(TEST_CFLAGS) -o $@ $^ -lm
+
+tools/vision_prepare: tools/vision_prepare.c vision.o format.o
+	$(CC) $(TEST_CFLAGS) -o $@ $^ -lm
+
+tests/test_vision_gpu: tests/test_vision_gpu.c xenolith.c xenolith.h vision_gpu.inc vision.o format.o $(GPU_OBJ)
+	$(CC) $(CFLAGS) -I. -o $@ $< vision.o format.o $(GPU_OBJ) $(LDLIBS)
+
+check-vision: tests/test_vision_input tests/test_vision_gpu
+	./tests/test_vision_input
+	./tests/test_vision_gpu
+
+tests/test_vision_session: tests/test_vision_session.c xenolith.c xenolith.h vision_gpu.inc format.o vision.o $(GPU_OBJ)
+	$(CC) $(CFLAGS) -I. -o $@ $< format.o vision.o $(GPU_OBJ) $(LDLIBS)
+
+tests/test_text_batch_model: tests/test_text_batch_model.c xenolith.o xenolith.h format.o vision.o $(GPU_OBJ)
+	$(CC) $(CFLAGS) -I. -o $@ $< xenolith.o format.o vision.o $(GPU_OBJ) $(LDLIBS)

@@ -1,7 +1,7 @@
 # Xenolith wire protocol
 
-This document describes protocol version 1 as implemented by [serve.c](serve.c).
-It is a local, text-only protocol for one served model. A client can maintain a
+This document describes protocol versions 1 and 2 as implemented by [serve.c](serve.c).
+It is a local protocol for one served model. A client can maintain a
 durable conversation by appending turns, or send a complete transcript for a
 temporary generation. Xenolith generates tool calls; the client executes tools.
 
@@ -27,6 +27,13 @@ available, otherwise `wire.sock` inside the state directory. Default state and
 cache directories are `$XDG_STATE_HOME/xenolith` and `$XDG_CACHE_HOME/xenolith/kv`,
 falling back to `~/.local/state/xenolith` and `~/.cache/xenolith/kv`.
 
+Without `--mmproj`, the service exposes the existing text-only protocol 1.
+With `--mmproj /path/to/mmproj-F16.gguf`, it exposes protocol 2 with images,
+using the locked artifacts in [vision/manifest.json](vision/manifest.json).
+Vision defaults to context 65536 and accepts only `--ctx 65536|131072`.
+Clients must inspect `describe.protocol` and `describe.vision` before sending
+images. A protocol 1 service rejects image requests and visual conversations.
+
 Each frame is one JSON object followed by a newline. Escape newlines inside
 strings; do not pretty-print a frame across lines. There are no request IDs or
 unsolicited greetings. Diagnostics go to stderr. Read continuously while a
@@ -48,6 +55,11 @@ other connections. `describe`, `list` and `stat` can be handled between generati
 steps on other connections. On the generating connection, commands other than
 `cancel` receive `busy`. Cancellation is cooperative, not an interrupt of a
 running kernel.
+
+In protocol 2, each frame is limited to 96 MiB, independently of context size.
+Image preparation in `append`, `rebuild` and `ephemeral` is synchronous; its
+cost precedes the reply or generation stream and is excluded from the existing
+prefill/decode counters. Cancellation is available once generation has started.
 
 Requests use an `op` string. Ordinary replies have `ok: true` and operation
 fields, or `ok: false`, `code` and `error`. Successful `generate` and `ephemeral`
@@ -118,6 +130,7 @@ in the table are in addition to `ok: true`; “empty” means `{"ok":true}`.
 | `checkpoint` | None | `saved`, `tokens`, and `reason` when not saved; attempts a snapshot of the bound session. |
 | `pending` | None | `calls`: unresolved tool-call IDs in the bound session. |
 | `history` | None | `entries`: the bound session's visible history. |
+| `media` (v2) | `image_id`, optional byte `offset` and `limit` | `offset`, `total`, Base64 `data`; retrieves media belonging to the bound conversation. |
 | `cancel` | None | Empty ACK for an active or queued generation on this connection; see cancellation below. |
 
 `append`, `generate`, `rebuild`, `rewind`, `rewind_cost`, `checkpoint`, `pending`
@@ -163,6 +176,52 @@ call if no name is supplied. Preserve result order when several calls use the
 same tool name. Imported `call_id` values are not preserved:
 rebuild creates new IDs. Read `history` afterward to recover the new markers and
 call IDs. Use ordinary `append` with the server-issued `call_id` for live results.
+
+### Images in protocol 2
+
+`describe.vision` advertises `formats` (`png`, `jpeg`), `budgets`
+(`70,140,280,560,1120`), `default_budget` (280), `max_bytes` (50331648),
+`max_context_media_bytes` (268435456) and `media_refs` (`true`).
+Each user message or tool result can include one image, alongside optional text:
+
+```json
+{"op":"append","role":"user","text":"What is shown?","image":{"data":"<Base64 PNG/JPEG>","budget":280}}
+```
+
+The same `image` field works on user/tool messages in `rebuild` and `ephemeral`.
+Assistant and system images are rejected. `budget` is optional; its value is an
+upper bound, and the actual visual length depends on aspect ratio. All valid
+image rows occupy context positions; launch padding occupies none. Multiple
+images use separate messages. Images are decoded as RGB, with EXIF orientation
+and alpha composited on white. Limits are 48 MiB encoded per image, 32 million
+decoded pixels, 16384 pixels per original dimension and 256 MiB of media in
+the active context. Encoded Base64 must be canonical standard Base64 with
+padding, without whitespace or URL-safe substitutions.
+
+`history.entries[].image` contains `id`, `bytes`, `budget` and actual `rows`.
+The `id` is SHA-256 of the original encoded bytes, scoped to the bound
+conversation, including records retained after rewind. It is a media reference,
+not a KV identity. To reuse retained media, provide exactly one of `data` or `id`:
+
+```json
+{"op":"append","role":"user","text":"Look again.","image":{"id":"<64 hex characters>","budget":70}}
+{"op":"media","image_id":"<64 hex characters>","offset":0,"limit":262144}
+```
+
+`media` defaults to a 256 KiB chunk. Its `limit` must be 1..50331648; `offset`
+must be 0..`total`. The last chunk can be shorter or empty at EOF. Decode each
+returned chunk independently and advance by its decoded byte count. Ephemeral
+images are not persisted and do not create retrievable media IDs.
+
+The conversation retains original image bytes, preprocessing metadata and
+model fingerprints, so deleting the original file or derived embedding cache
+does not lose the image. Derived embeddings live in `CACHE/vision-v1`, with
+a 2 GiB eviction budget. Their identity includes content, resized pixels,
+budget, both weight hashes, source/compiler/SPIR-V fingerprints, GPU identity,
+driver version and the compiled native GPU module. Visual KV snapshots bind
+the complete mixed input and numerical fingerprint. A mismatch triggers replay;
+a missing or corrupt source is an explicit error. Old model artifacts require
+rebuilding the conversation with the intended model and media.
 
 ### Generation settings
 
