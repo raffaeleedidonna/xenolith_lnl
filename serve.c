@@ -655,7 +655,7 @@ static void serve_log_resume(const runtime_resume_report *r) {
 
 static void serve_log_kvstore(const runtime *w, const char *cache_dir) {
     int status = runtime_kvstore_open_status(w);
-    if (status == KVSTORE_OK) return;
+    if (status == KVSTORE_OK || status == KVSTORE_DISABLED) return;
     fprintf(stderr, "xenolith: kvstore disabled: open failed (%s) at %s; "
             "sessions will not resume from cache\n",
             kvstore_status_name((kvstore_status)status),
@@ -1782,11 +1782,14 @@ static int serve_stdin_interactive(void) {
     return !S_ISREG(st.st_mode);
 }
 
-int serve_stdio(xe_engine *engine, const char *state_dir,
-                const char *cache_dir) {
+int serve_stdio(xe_engine *engine, const char *state_dir, const char *cache_dir) {
+    return serve_stdio_with_budget(engine, state_dir, cache_dir, KVSTORE_DEFAULT_BUDGET);
+}
+int serve_stdio_with_budget(xe_engine *engine, const char *state_dir,
+                            const char *cache_dir, uint64_t cache_budget) {
     serve s;
     serve_init(&s, engine);
-    runtime_status status = runtime_open(&s.w, engine, state_dir, cache_dir);
+    runtime_status status = runtime_open_with_budget(&s.w, engine, state_dir, cache_dir, cache_budget);
     if (status != RUNTIME_OK) {
         fprintf(stderr, "xenolith: wire: %s\n", runtime_status_code(status));
         return 1;
@@ -1844,6 +1847,11 @@ static int serve_listen(serve *s, const char *path) {
 
 int serve_run(xe_engine *engine, const char *state_dir, const char *cache_dir,
               const char *socket_path, double idle_minutes) {
+    return serve_run_with_budget(engine, state_dir, cache_dir, socket_path,
+                                 idle_minutes, KVSTORE_DEFAULT_BUDGET);
+}
+int serve_run_with_budget(xe_engine *engine, const char *state_dir, const char *cache_dir,
+                          const char *socket_path, double idle_minutes, uint64_t cache_budget) {
     serve s;
     serve_init(&s, engine);
     if (idle_minutes > 0.0) {
@@ -1851,7 +1859,7 @@ int serve_run(xe_engine *engine, const char *state_dir, const char *cache_dir,
         if (ms > 9.0e15) ms = 9.0e15;
         s.idle_ms = ms < 1.0 ? 1 : (int64_t)ms;
     }
-    runtime_status status = runtime_open(&s.w, engine, state_dir, cache_dir);
+    runtime_status status = runtime_open_with_budget(&s.w, engine, state_dir, cache_dir, cache_budget);
     if (status != RUNTIME_OK) {
         fprintf(stderr, "xenolith: serve: %s\n", runtime_status_code(status));
         return 1;

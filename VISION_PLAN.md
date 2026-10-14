@@ -6,6 +6,10 @@ regressioni e benchmark conclusivi documentati in `vision/VALIDATION.md`.
 La latenza dell'encoder a 1120 rimane sperimentale. Xenopi richiede
 l'adattamento del client al protocollo v2. Base Xenolith esaminata:
 `36a4c12cdf75bbfb05426233dae54037ba1d6641`.
+Integrato successivamente il `main` upstream a `4521185`, con checkpoint KV
+condivisi, conservazione per budget, snapshot testuali v2 e visuali v3.
+Migrazione dei media, regressioni e benchmark aggiuntivi sono in
+`vision/VALIDATION.md` e `vision/results/upstream-cache-integration.json`.
 
 ## Obiettivo e prima versione
 
@@ -283,7 +287,7 @@ I media restano riutilizzabili per replay dopo un cambio di modalità.
   con filtraggio dei canali del modello e dump numerici opzionali.
 - Primitive C delle sessioni: copie possedute, prefissi con immagini, append
   conservando KV compatibile, replay, rewind ai confini, shadow/COW e snapshot
-  visuali v2.
+  visuali v3 (v2 testuale upstream, v2 visuale precedente ricostruito dai media).
 - Runtime/conversation/kvstore: media originali persistenti, cache embeddings
   ricostruibile e limitata a 2 GiB, mappa visuale aggiornata dopo le proiezioni
   della cronologia, riavvio e ripristino degli snapshot.

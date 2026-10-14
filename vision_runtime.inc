@@ -251,6 +251,12 @@ static xe_input runtime_visual_input(runtime *w,const int32_t *tokens,int count)
     return input;
 }
 
+static int runtime_visual_boundary(const runtime *w,int position) {
+    for(size_t i=0;i<w->visual_count;i++)
+        if(position>w->visual[i].start && position<w->visual[i].start+w->visual[i].rows)return 0;
+    return 1;
+}
+
 static int runtime_visual_common(runtime *w,xe_session *session,const xe_tokens *tokens) {
     if(!w->vision_touched)return xe_session_common(session,tokens);
     xe_input input=runtime_visual_input(w,tokens->v,tokens->len);

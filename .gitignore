@@ -92,3 +92,6 @@ tests/test_vision_session
 
 /tests/test_sha256_fast
 /tests/test_weights_identity
+/tests/test_cache_policy
+/tests/test_cache_model
+/tests/test_visual_cache

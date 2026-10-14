@@ -1469,6 +1469,58 @@ conversation_status conversation_list(conversation_store *store,
     return CONVERSATION_OK;
 }
 
+conversation_status conversation_cache_index(conversation_store *store,
+                                             kvstore *cache) {
+    if (!store || !cache) return CONVERSATION_INVALID_ARGUMENT;
+    int duplicate = openat(store->sessions_fd, ".",
+                           O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (duplicate < 0) return CONVERSATION_IO;
+    DIR *directory = fdopendir(duplicate);
+    if (!directory) {
+        close(duplicate);
+        return CONVERSATION_IO;
+    }
+    conversation_status status = CONVERSATION_OK;
+    struct dirent *entry;
+    for (;;) {
+        errno = 0;
+        entry = readdir(directory);
+        if (!entry) {
+            if (errno) status = CONVERSATION_IO;
+            break;
+        }
+        conversation_id id;
+        if (!conversation_id_from_hex(entry->d_name, &id)) continue;
+        conversation *c = NULL;
+        int resumable = 0;
+        conversation_status opened = conversation_open_mode(
+            store, &id, &c, 1, &resumable);
+        if (!c) {
+            if (opened == CONVERSATION_MISS || opened == CONVERSATION_DAMAGED ||
+                opened == CONVERSATION_VERSION) continue;
+            status = opened;
+            break;
+        }
+        kvstore_id group;
+        memcpy(group.bytes, id.bytes, sizeof group.bytes);
+        /* Include old epochs and rewound branches: their snapshots still
+         * belong to this conversation and count against its total size. */
+        for (uint64_t i = 0; i < conversation_event_count(c); i++) {
+            const conversation_event *event = conversation_event_at(c, i);
+            if (event->type != CONVERSATION_EVENT_SNAPSHOT_REF) continue;
+            kvstore_status ks = kvstore_set_group(cache, &event->snapshot, &group);
+            if (ks != KVSTORE_OK && ks != KVSTORE_MISS) {
+                status = CONVERSATION_IO;
+                break;
+            }
+        }
+        conversation_close(c);
+        if (status != CONVERSATION_OK) break;
+    }
+    closedir(directory);
+    return status;
+}
+
 static int conversation_discard_tail(conversation *c) {
     return ftruncate(c->fd, (off_t)c->append_end) == 0 &&
            fsync(c->fd) == 0;
@@ -2093,6 +2145,24 @@ conversation_status conversation_project(conversation *c, int thinking,
     return CONVERSATION_OK;
 }
 
+int conversation_snapshot_previous(const conversation *c, kvstore_id *id,
+                                    uint64_t *boundary, uint64_t *event_index) {
+    uint64_t best = 0, best_index = 0; int found = 0;
+    for (uint64_t i = 0; i < c->event_count; i++) {
+        const conversation_event *ev = &c->events[i].view;
+        if (ev->type != CONVERSATION_EVENT_SNAPSHOT_REF || ev->epoch != c->epoch ||
+            !ev->snapshot_boundary || ev->snapshot_boundary > c->token_count ||
+            ev->snapshot_boundary > *boundary ||
+            (ev->snapshot_boundary == *boundary && i >= *event_index)) continue;
+        if (!found || ev->snapshot_boundary > best ||
+            (ev->snapshot_boundary == best && i > best_index)) {
+            best = ev->snapshot_boundary; best_index = i; *id = ev->snapshot; found = 1;
+        }
+    }
+    if (found) { *boundary = best; *event_index = best_index; }
+    return found;
+}
+
 int conversation_snapshot_current(const conversation *c, kvstore_id *id,
                                   uint64_t *boundary) {
     if (!c->has_snapshot) return 0;
@@ -2169,17 +2239,17 @@ conversation_status conversation_resume(conversation *c, kvstore *store,
     }
     xe_tokens full = { c->tokens, (int)c->token_count,
                        (int)c->token_count };
-    if (store && c->has_snapshot && c->snapshot_boundary > 0 &&
-        c->snapshot_boundary <= c->token_count) {
-        xe_tokens prefix = { c->tokens, (int)c->snapshot_boundary,
-                             (int)c->snapshot_boundary };
+    uint64_t boundary = c->token_count, cursor = UINT64_MAX;
+    kvstore_id id;
+    while (store && conversation_snapshot_previous(c, &id, &boundary, &cursor)) {
+        xe_tokens prefix = {c->tokens, (int)boundary, (int)boundary};
         xe_snapshot_status core;
-        kvstore_status loaded = kvstore_load(store, &c->snapshot, session,
-                                             &prefix, &core);
-        if (loaded == KVSTORE_OK && report) {
-            report->used_snapshot = 1;
-            report->boundary = c->snapshot_boundary;
-            report->zero_prefill = c->snapshot_boundary == c->token_count;
+        if (kvstore_load(store, &id, session, &prefix, &core) == KVSTORE_OK) {
+            if (report) {
+                report->used_snapshot = 1; report->boundary = boundary;
+                report->zero_prefill = boundary == c->token_count;
+            }
+            break;
         }
     }
     xe_session_sync(session, &full);

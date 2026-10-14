@@ -5737,6 +5737,13 @@ int xe_session_token_near_top(xe_session *s, int32_t token,
 }
 
 enum {
+    XE_SNAPSHOT_FORMAT_VERSION = 2,
+    XE_SNAPSHOT_VISUAL_VERSION = 3,
+    /* State compatibility, not build identity. Bump when persisted KV/logits
+     * can no longer be continued under the same numerical contract. Review
+     * inference changes explicitly; edits to I/O, CLI or docs do not bump it.
+     * Supporting a new ABI also requires reviewing the legacy reader below. */
+    XE_SNAPSHOT_NUMERIC_ABI = 1,
     XE_SNAPSHOT_HEADER_SIZE = 384,
     XE_SNAPSHOT_ENTRY_SIZE = 40,
     XE_SNAPSHOT_REQUIRED_SECTIONS = 6,
@@ -5806,6 +5813,36 @@ static void xe_snapshot_hash_string(format_sha256 *hash, const char *s) {
     size_t len = strlen(s);
     xe_snapshot_hash_u64(hash, len);
     format_sha256_update(hash, s, len);
+}
+
+/* The v1 hash is opaque: it does not encode a recoverable commit/compiler.
+ * Recognize only the audited baseline, with this build's compiler, flags,
+ * workers, RMS mode and compiled kernel. Other v1 producers remain rejected.
+ * The source hash is Makefile's hash of `sha256sum xenolith.c xenolith.cl`
+ * at 68b8fbf55787eda392c8cbfa32bab5ad14622e8a, not of the current sources. */
+static int xe_snapshot_legacy_numeric_matches(const xe_engine *e,
+                                               const uint8_t saved[32]) {
+    if (XE_SNAPSHOT_NUMERIC_ABI != 1 ||
+        !strcmp(XE_NUMERIC_CFLAGS_HASH, "unknown")) return 0;
+    format_sha256 hash;
+    format_sha256_init(&hash);
+    format_sha256_update(&hash, "xenolith-numeric-v1",
+                         sizeof("xenolith-numeric-v1") - 1);
+    xe_snapshot_hash_u32(&hash, 1);
+    xe_snapshot_hash_string(&hash, "68b8fbf55");
+    xe_snapshot_hash_string(&hash,
+        "528b6db377397368158a28dc155047628ac30a5a06c38aa6c32a5680ccd56d84");
+    xe_snapshot_hash_string(&hash, XE_NUMERIC_CFLAGS_HASH);
+    xe_snapshot_hash_string(&hash, __VERSION__);
+    xe_snapshot_hash_u32(&hash, XE_WORKERS);
+    xe_snapshot_hash_u32(&hash, e->scalar_rms);
+    size_t spv_size = (size_t)(_binary_xenolith_gpu_spv_end -
+                               _binary_xenolith_gpu_spv_start);
+    xe_snapshot_hash_u64(&hash, spv_size);
+    format_sha256_update(&hash, _binary_xenolith_gpu_spv_start, spv_size);
+    uint8_t expected[32];
+    format_sha256_final(&hash, expected);
+    return memcmp(saved, expected, sizeof expected) == 0;
 }
 
 static void xe_snapshot_fingerprints_init(xe_engine *e) {
@@ -5914,19 +5951,16 @@ static void xe_snapshot_fingerprints_init(xe_engine *e) {
                         e->snapshot_fingerprint[XE_SNAPSHOT_FP_CONTEXT]);
 
     format_sha256_init(&hash);
-    format_sha256_update(&hash, "xenolith-numeric-v1",
-                         sizeof("xenolith-numeric-v1") - 1);
-    xe_snapshot_hash_u32(&hash, 1);
-    xe_snapshot_hash_string(&hash, XE_BUILD_COMMIT);
-    xe_snapshot_hash_string(&hash, XE_NUMERIC_SOURCE_HASH);
-    xe_snapshot_hash_string(&hash, XE_NUMERIC_CFLAGS_HASH);
-    xe_snapshot_hash_string(&hash, __VERSION__);
+    format_sha256_update(&hash, "xenolith-numeric-abi-v1",
+                         sizeof("xenolith-numeric-abi-v1") - 1);
+    xe_snapshot_hash_u32(&hash, XE_SNAPSHOT_NUMERIC_ABI);
     xe_snapshot_hash_u32(&hash, XE_WORKERS);
     xe_snapshot_hash_u32(&hash, e->scalar_rms);
-    size_t spv_size = (size_t)(_binary_xenolith_gpu_spv_end -
-                               _binary_xenolith_gpu_spv_start);
-    xe_snapshot_hash_u64(&hash, spv_size);
-    format_sha256_update(&hash, _binary_xenolith_gpu_spv_start, spv_size);
+#ifdef __FAST_MATH__
+    xe_snapshot_hash_u32(&hash, 1);
+#else
+    xe_snapshot_hash_u32(&hash, 0);
+#endif
     format_sha256_final(&hash,
                         e->snapshot_fingerprint[XE_SNAPSHOT_FP_NUMERIC]);
     e->snapshot_fingerprint_ready = 1;
@@ -6115,7 +6149,7 @@ static void xe_snapshot_encode_header(xe_engine *e,
                                       uint8_t header[XE_SNAPSHOT_HEADER_SIZE]) {
     memset(header, 0, XE_SNAPSHOT_HEADER_SIZE);
     memcpy(header, xe_snapshot_magic, sizeof xe_snapshot_magic);
-    format_put_u16le(header + 8, 1);
+    format_put_u16le(header + 8, XE_SNAPSHOT_FORMAT_VERSION);
     format_put_u16le(header + 10, 0);
     format_put_u32le(header + 12, XE_SNAPSHOT_HEADER_SIZE);
     format_put_u32le(header + 16, XE_SNAPSHOT_ENTRY_SIZE);
@@ -6133,10 +6167,15 @@ static void xe_snapshot_encode_header(xe_engine *e,
     for (int i = 0; i < XE_SNAPSHOT_FP_COUNT; i++)
         memcpy(header + 96 + 32 * i, e->snapshot_fingerprint[i], 32);
     memcpy(header + 288, boundary, 32);
+    format_put_u32le(header + 320, XE_SNAPSHOT_NUMERIC_ABI);
+    /* Diagnostic strings are NUL-terminated and truncated to fit. They are
+     * covered by the checksum, but never used to decide compatibility. */
+    snprintf((char *)header + 328, 16, "%.15s", XE_BUILD_COMMIT);
+    snprintf((char *)header + 344, 32, "%.31s", __VERSION__);
     format_put_u64le(header + 376, format_crc64(0, header, 376));
 }
 
-xe_snapshot_status xe_session_snapshot_save(xe_session *s, FILE *out) {
+xe_snapshot_status xe_session_snapshot_stream(xe_session *s, FILE *out) {
     if (s && s->cow) return XE_SNAPSHOT_INVALID_ARGUMENT;
     if (!s || !out) return XE_SNAPSHOT_INVALID_ARGUMENT;
     xe_require_owner(s->engine);
@@ -6195,18 +6234,31 @@ xe_snapshot_status xe_session_snapshot_save(xe_session *s, FILE *out) {
     if (s->visual_context) {
         xe_input input=s->visual_context->owned.input;
         input.tokens=s->tokens;input.count=s->n_tokens;
-        format_put_u16le(header+8,2);format_put_u32le(header+24,1);
+        format_put_u16le(header+8,XE_SNAPSHOT_VISUAL_VERSION);format_put_u32le(header+24,1);
         memcpy(header+96,xe_engine_model_fingerprint(s->engine),32);
         if(!xe_snapshot_visual_numeric(s->engine,header+96+32*XE_SNAPSHOT_FP_NUMERIC)){free(buffer);return XE_SNAPSHOT_BACKEND;}
+        /* Visual identity occupies 320..351. ABI replaces text diagnostics;
+         * the payload layout stays unchanged for shared global KV segments. */
+        memset(header+320,0,56);
         xe_input_hash(&input,header+320);
+        format_put_u32le(header+352,XE_SNAPSHOT_NUMERIC_ABI);
         format_put_u64le(header+376,format_crc64(0,header,376));
     }
     int ok = format_seek(out, 0) &&
              format_write(out, header, sizeof header) &&
              format_write(out, directory, sizeof directory) &&
-             fflush(out) == 0 && ftruncate(fileno(out), (off_t)layout.file_size) == 0;
+             fflush(out) == 0;
     free(buffer);
     return ok ? XE_SNAPSHOT_OK : XE_SNAPSHOT_IO;
+}
+
+xe_snapshot_status xe_session_snapshot_save(xe_session *s, FILE *out) {
+    xe_snapshot_status status = xe_session_snapshot_stream(s, out);
+    if (status != XE_SNAPSHOT_OK) return status;
+    uint64_t size;
+    status = xe_session_snapshot_size(s, &size);
+    if (status != XE_SNAPSHOT_OK) return status;
+    return ftruncate(fileno(out), (off_t)size) == 0 ? XE_SNAPSHOT_OK : XE_SNAPSHOT_IO;
 }
 
 static xe_snapshot_status xe_snapshot_fingerprint_status(int index) {
@@ -6239,19 +6291,27 @@ static xe_snapshot_status xe_snapshot_parse_header(
     if (memcmp(saved_header, xe_snapshot_magic, sizeof xe_snapshot_magic) != 0)
         return XE_SNAPSHOT_FORMAT;
     uint16_t version=format_get_u16le(saved_header+8);
-    int visual=version==2 && format_get_u32le(saved_header+24)==1;
-    if (version!=1 && !visual) return XE_SNAPSHOT_VERSION;
-    if (visual && (!mixed || !mixed->visual_count)) return XE_SNAPSHOT_TOKEN_MISMATCH;
-    if (!visual && mixed && mixed->visual_count) return XE_SNAPSHOT_TOKEN_MISMATCH;
+    uint32_t flags=format_get_u32le(saved_header+24);
+    int legacy_visual=version==2 && flags==1;
+    int visual=legacy_visual || (version==XE_SNAPSHOT_VISUAL_VERSION && flags==1);
+    if ((version!=1 && version!=XE_SNAPSHOT_FORMAT_VERSION && !visual) ||
+        format_get_u16le(saved_header+10)!=0) return XE_SNAPSHOT_VERSION;
     if (format_get_u32le(saved_header + 12) != XE_SNAPSHOT_HEADER_SIZE ||
         format_get_u32le(saved_header + 16) != XE_SNAPSHOT_ENTRY_SIZE)
         return XE_SNAPSHOT_VERSION;
     if ((!visual && format_get_u32le(saved_header + 24) != 0) ||
         format_get_u32le(saved_header + 28) != 0 ||
-        !xe_snapshot_all_zero(saved_header + (visual?352:320), visual?24:56))
+        (version == 1 && !xe_snapshot_all_zero(saved_header + 320, 56)) ||
+        (legacy_visual && !xe_snapshot_all_zero(saved_header+352,24)) ||
+        (visual && !legacy_visual && !xe_snapshot_all_zero(saved_header+356,20)) ||
+        (!visual && version == XE_SNAPSHOT_FORMAT_VERSION &&
+         (format_get_u32le(saved_header + 324) != 0 ||
+          saved_header[343] != 0 || saved_header[375] != 0)))
         return XE_SNAPSHOT_FORMAT;
     if (format_get_u64le(saved_header + 376) !=
         format_crc64(0, saved_header, 376)) return XE_SNAPSHOT_FORMAT;
+    if (visual && (!mixed || !mixed->visual_count)) return XE_SNAPSHOT_TOKEN_MISMATCH;
+    if (!visual && mixed && mixed->visual_count) return XE_SNAPSHOT_TOKEN_MISMATCH;
 
     memset(layout, 0, sizeof *layout);
     for (int i = 0; i < XE_SNAPSHOT_REQUIRED_SECTIONS; i++)
@@ -6336,12 +6396,27 @@ static xe_snapshot_status xe_snapshot_parse_header(
             return XE_SNAPSHOT_FORMAT;
     }
 
-    uint8_t visual_numeric[32];
-    if(visual&&!xe_snapshot_visual_numeric(e,visual_numeric))return XE_SNAPSHOT_BACKEND;
-    for (int i = 0; i < XE_SNAPSHOT_FP_COUNT; i++) {
+    for (int i = 0; i < XE_SNAPSHOT_FP_NUMERIC; i++) {
         const uint8_t *current=visual&&i==XE_SNAPSHOT_FP_MODEL?xe_engine_model_fingerprint(e):
-            visual&&i==XE_SNAPSHOT_FP_NUMERIC?visual_numeric:e->snapshot_fingerprint[i];
+            e->snapshot_fingerprint[i];
         if(memcmp(saved_header+96+32*i,current,32))return xe_snapshot_fingerprint_status(i);
+    }
+    const uint8_t *numeric = saved_header + 96 + 32 * XE_SNAPSHOT_FP_NUMERIC;
+    if (legacy_visual) {
+        /* Its opaque build-bound numeric identity predates the stable text
+         * ABI. Recognize the format, but replay media rather than guess. */
+        return XE_SNAPSHOT_NUMERIC_MISMATCH;
+    } else if (visual) {
+        uint8_t visual_numeric[32];
+        if(!xe_snapshot_visual_numeric(e,visual_numeric))return XE_SNAPSHOT_BACKEND;
+        if(format_get_u32le(saved_header+352)!=XE_SNAPSHOT_NUMERIC_ABI ||
+           memcmp(numeric,visual_numeric,32))return XE_SNAPSHOT_NUMERIC_MISMATCH;
+    } else if (version == 1) {
+        if (!xe_snapshot_legacy_numeric_matches(e, numeric))
+            return XE_SNAPSHOT_NUMERIC_MISMATCH;
+    } else if (format_get_u32le(saved_header + 320) != XE_SNAPSHOT_NUMERIC_ABI ||
+               memcmp(numeric, e->snapshot_fingerprint[XE_SNAPSHOT_FP_NUMERIC], 32)) {
+        return XE_SNAPSHOT_NUMERIC_MISMATCH;
     }
     uint8_t boundary[32];
     xe_snapshot_boundary_hash(expected->v, expected->len, boundary);
@@ -6451,6 +6526,39 @@ static xe_snapshot_status xe_snapshot_read_kv(
         }
     }
     return crc == section->crc ? XE_SNAPSHOT_OK : XE_SNAPSHOT_FORMAT;
+}
+
+xe_snapshot_status xe_session_snapshot_check_prefix(xe_session *s, FILE *in,
+                                                     uint64_t position) {
+    if (!s || !in || !position || position > (uint64_t)s->n_tokens)
+        return XE_SNAPSHOT_INVALID_ARGUMENT;
+    xe_require_owner(s->engine);
+    xe_snapshot_fingerprints_init(s->engine);
+    xe_tokens expected = {s->tokens, (int)position, (int)position};
+    xe_input prefix={0};
+    const xe_input *mixed=NULL;
+    if(s->visual_context) {
+        prefix=s->visual_context->owned.input;
+        prefix.tokens=s->tokens;prefix.count=s->n_tokens;
+        if(!xe_input_boundary(&prefix,(int)position))return XE_SNAPSHOT_TOKEN_MISMATCH;
+        prefix.count=(int)position;prefix.visual_count=0;
+        while(prefix.visual_count<s->visual_context->owned.input.visual_count &&
+              prefix.visual[prefix.visual_count].start+prefix.visual[prefix.visual_count].rows<=prefix.count)
+            prefix.visual_count++;
+        if(prefix.visual_count)mixed=&prefix;
+    }
+    uint8_t header[XE_SNAPSHOT_HEADER_SIZE];
+    uint8_t directory[XE_SNAPSHOT_MAX_SECTIONS * XE_SNAPSHOT_ENTRY_SIZE];
+    xe_snapshot_layout layout;
+    xe_snapshot_status status = xe_snapshot_parse_header(
+        s->engine, in, &expected, mixed, &layout, header, directory);
+    if (status != XE_SNAPSHOT_OK) return status;
+    uint8_t *buffer = malloc(XE_SNAPSHOT_BUFFER_SIZE);
+    if (!buffer) return XE_SNAPSHOT_NOMEM;
+    status = xe_snapshot_verify_section(in,
+        &layout.sections[layout.known[XE_SNAPSHOT_TOKENS - 1]], buffer, &expected);
+    free(buffer);
+    return status;
 }
 
 static xe_snapshot_status xe_session_snapshot_load_impl(xe_session *s, FILE *in,

@@ -89,6 +89,19 @@ int main(void) {
     ok &= check("chat", model, visual_no_image, "Usage:");
     char *visual_no_projector[] = { "--image", "missing.jpg", NULL };
     ok &= check("chat", model, visual_no_projector, "Usage:");
+    const char *cache_commands[] = {"wire", "serve"};
+    char *budgets[] = {"0", "1", "16GiB", "12000MB", "512KiB", "42B", "18446744073709551615"};
+    char *bad_budgets[] = {"", "-1", "+1", "1.5GiB", " 1", "1 ", "1GBx", "18446744073709551616", "18446744073709551615GiB"};
+    for (size_t c = 0; c < 2; c++) {
+        for (size_t i = 0; i < sizeof budgets / sizeof *budgets; i++) {
+            char *args[] = {"--cache-budget", budgets[i], "--ctx", "4097", NULL};
+            ok &= check(cache_commands[c], model, args, model);
+        }
+        for (size_t i = 0; i < sizeof bad_budgets / sizeof *bad_budgets; i++) {
+            char *args[] = {"--cache-budget", bad_budgets[i], NULL};
+            ok &= check(cache_commands[c], model, args, "Usage:");
+        }
+    }
     char lock[256];
     snprintf(lock, sizeof lock, "%s/xenolith/engine.lock", root);
     unlink(lock);

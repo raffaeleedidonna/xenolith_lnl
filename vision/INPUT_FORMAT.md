@@ -49,12 +49,30 @@ encoded image, 256 MiB total media, 2 GiB archive and 131072 logical elements.
 archive's projected rows are a derived cache; an encoder revision change
 requires re-encoding and a new identity.
 
-Visual KV snapshots use version 2 of `XENXKV`: the six existing KV sections
+Visual KV snapshots use version 3 of `XENXKV`: the six existing KV sections
 are unchanged. Header flag at byte 24 is 1, bytes 320..351 contain the complete
-computed-input hash, and MODEL binds the selected language-model fingerprint. Loading requires
+computed-input hash, bytes 352..355 contain the text numerical ABI, and
+bytes 356..375 are reserved zero. MODEL binds the selected language-model fingerprint. Loading requires
 `xe_session_snapshot_load_input` and the matching mixed input. Token-only
-load rejects these snapshots. Text snapshots still use version 1. Checkpointing
+load rejects these snapshots. Text snapshots use upstream version 2 with its
+stable numerical ABI and diagnostic fields. The older visual version 2 is
+recognized by flag 1 but conservatively rejected for numerical compatibility;
+the runtime re-encodes/replays retained media without changing history. Legacy
+text version 1 retains upstream's audited compatibility check; changed kernels
+do not qualify for that bridge. Checkpointing
 a COW shadow is rejected; promote it before saving.
+
+Grouped visual checkpoints use upstream's `XEKVSEG` disk envelope and
+content-addressed `.xkc` segments for the global KV streams. Prefix checks bind
+the complete mixed input, omit images following the checkpoint boundary and
+reject boundaries inside an image. Reserve pruning occurs only after the
+transcript durably references the new checkpoint. Restore tries older compatible
+checkpoints when the latest one is missing or rejected.
+
+`--cache-budget` bounds checkpoint files/shared segments (default 16 GiB).
+Projected embedding files remain a separate rebuildable cache capped at 2 GiB.
+Setting the budget to zero disables disk reads/writes for both caches while
+preserving existing files and durable transcript media.
 
 The persistent runtime stores one `CONVERSATION_BLOCK_IMAGE` (type 4) alongside
 the text block in user messages and tool results. `XEVIMG1\n` records contain a

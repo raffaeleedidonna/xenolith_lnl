@@ -3,6 +3,14 @@
 
 #include "xenolith.h"
 
+/* Seekable stream serializer; unlike snapshot_save, does not truncate an fd.
+ * Used by the disk cache to write shared segments without a full temporary. */
+xe_snapshot_status xe_session_snapshot_stream(xe_session *s, FILE *out);
+
+/* Check snapshot identity and token prefix without touching inference state. */
+xe_snapshot_status xe_session_snapshot_check_prefix(xe_session *s, FILE *in,
+                                                     uint64_t position);
+
 int xe_session_anchor_capture(xe_session *s);
 int xe_session_anchor_restore(xe_session *s);
 void xe_session_anchor_clear(xe_session *s);

@@ -146,6 +146,12 @@ Computed caches bind the policy; metadata-mode caches also bind inode/device
 and modification/status-change timestamps. Persisted media can be replayed
 when verification mode changes.
 
+Visual sessions use shared global-KV checkpoint segments and visual snapshot
+format v3 alongside upstream's text snapshot v2. Earlier visual snapshots replay
+retained media. `wire`/`serve --cache-budget SIZE` bounds KV checkpoints (default
+16 GiB); projected embeddings have a separate 2 GiB limit. A zero budget disables
+both disk caches without deleting existing files or transcript media.
+
 `--prefill 512|1024` selects the text batch size for `run` and `bench`; 512
 remains the default. Visual spans are processed whole regardless of that text
 setting. Compute padding adds no context elements.

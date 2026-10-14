@@ -304,6 +304,103 @@ metadata carica lo snapshot. I media persistenti rimangono utilizzabili;
 embedding e KV incompatibili non vengono riusati. Campioni, log e checksum
 sono nel [report](results/openssl-startup.json).
 
+## Integrazione dei checkpoint upstream
+
+Il branch integra il `main` di Simone al commit
+`4521185b381bf9f48e5a12ff9abb05eb5a3a164b`, inclusa la deduplicazione e
+conservazione per budget introdotta da `fbd03cf`. I kernel e il calcolo
+dell’encoder restano quelli della versione vision precedente.
+
+Gli snapshot testuali usano il formato upstream v2 e l’ABI numerica stabile.
+Gli snapshot visuali usano v3, con hash dell’input misto a byte 320 e ABI a
+byte 352. Questo evita la collisione tra il precedente v2 visuale e il v2
+testuale upstream. I vecchi snapshot visuali sono riconosciuti e rifiutati
+conservativamente: il runtime ricostruisce il contesto dai media originali.
+Il bridge v1 testuale richiede il kernel storico; questa build vision lo ha
+modificato e ricostruisce il prefisso anziché dichiararlo compatibile.
+
+I checkpoint di una conversazione condividono i segmenti della KV globale
+tramite l’envelope `XEKVSEG` e file `.xkc`. Il controllo dei predecessori
+include identità delle immagini, embedding, media, budget e confini completi;
+le immagini successive al checkpoint sono escluse dal suo prefisso. La
+potatura segue il riferimento durevole nel transcript. Il ripristino cerca
+anche checkpoint precedenti quando quello più recente manca o viene rifiutato.
+
+`--cache-budget` limita checkpoint e segmenti condivisi, mentre gli embedding
+hanno un limite separato di 2 GiB. Con budget zero entrambi i percorsi di cache
+su disco sono disabilitati; i file esistenti e i media persistenti restano.
+
+Il nuovo test host `tests/test_visual_cache.c` usa il serializer/cache reale
+con KV deterministica: verifica v3/ABI, riconoscimento del vecchio v2 visuale,
+immagini diverse con stessi token/righe, variazioni di embedding/media/budget,
+prefissi prima di una seconda immagine, rifiuto dei confini interni, riserve,
+deduplicazione, riapertura, cache disabilitata e rimozione dei segmenti.
+Per checkpoint visuali a 256/512 elementi lo spazio passa da 175.116.544 byte
+standalone complessivi a 169.876.512 byte condivisi. È una fixture di storage,
+non una misura di qualità visuale o della memoria GPU.
+
+Il test upstream a 32k/64k su buffer host passa con ripristino esatto:
+2.435.187.968 byte standalone contro 1.764.406.976 condivisi, risparmiando
+670.780.992 byte entro un budget di 2 GiB. Non implica lo stesso risparmio
+per ogni conversazione.
+
+Le suite host/context/GPU/vision e persistenza passano sulla Lunar Lake.
+Il confronto tra processi conferma il riuso testuale v2 senza prefill; il
+vecchio v1 con kernel storico viene rifiutato e ricostruito con logits e
+continuazione identici a 64 e 1057 elementi, inclusa la finestra SWA avvolta.
+
+Le prove end-to-end a 64k e 128k passano: migrazione da un eseguibile
+pre-integrazione reale, cronologia/media invariati, ricostruzione v2 visuale,
+riuso v3 dopo riavvio, recupero da un predecessore quando l’ultimo checkpoint
+è corrotto, budget zero senza modificare le cache e rimozione per budget senza
+perdere l’immagine. Passano anche tutti i controlli del protocollo visuale,
+inclusi seconda immagine con diversa risposta, rewind, tool result, rebuild,
+ephemeral, cancellazione e OCR sintetico. Il cambio OpenSSL → metadati →
+metadati → OpenSSL conserva i media e rispetta la compatibilità delle cache.
+
+I quattro dump testuali a 64k/128k coincidono byte per byte con la baseline
+pre-vision. L’encoder a 70 produce lo stesso SHA-256 già validato
+(`7872f946040c3872034f57d54a15cfda858df35ddbc0fc07ba1423b41fa56587`).
+La chat del gattino riconosce il gatto e descrive lo stesso mantello.
+La sessione 128k/1120 senza tracing passa risposta, checkpoint e riavvio con
+riuso dello snapshot; la lettura finale di memoria riporta `VmSwap=0` e
+`VmHWM=26.119.396 KiB`. Non è una traccia continua della memoria GPU.
+
+Confronto ABBA sulla Lunar Lake rispetto all’eseguibile vision/OpenSSL
+precedente all’integrazione: 3 ripetizioni per esecuzione, 6 campioni per
+variante e contesto, warmup, prefill testuale 512 e pausa di 1 secondo.
+
+| Contesto | Fase | Mediana precedente (token/s) | Mediana integrata (token/s) | Differenza |
+|---|---|---:|---:|---:|
+| 64k | pp2048 | 225,79 | 235,19 | +4,16% |
+| 64k | tg128 | 23,15 | 22,81 | −1,50% |
+| 128k | pp2048 | 231,86 | 228,24 | −1,56% |
+| 128k | tg128 | 23,82 | 24,71 | +3,77% |
+
+Gli intervalli min/max dei campioni si sovrappongono in tutti i confronti:
+non emerge una regressione rilevante da queste misure. Le variazioni positive
+non dimostrano un’accelerazione del calcolo, che non è stato modificato.
+Campioni, hash dei sorgenti/eseguibili, esiti e checksum dei log sono nel
+[report dell’integrazione](results/upstream-cache-integration.json).
+
+Per riprodurre la migrazione con due eseguibili e directory isolate:
+
+```sh
+make check-unit check-context check-gpu check-vision
+make check-cache-large
+make check-persistence check-runtime check-serve MODEL=/path/to/model.gguf
+make check-snapshot-compat-model MODEL=/path/to/model.gguf
+python3 tools/vision_cache_integration_check.py \
+  --engine ./xenolith --previous-engine /path/to/pre-integration/xenolith \
+  --model /path/to/model.gguf --mmproj /path/to/mmproj-F16.gguf \
+  --image vision/fixtures/quadrants.png --ctx 65536 --output vision-runs/migration64
+```
+
+Ripetere l’ultimo comando con `--ctx 131072` e un output nuovo. Il controllo
+dei formati storici richiede il commit baseline nella storia Git oppure
+`LEGACY_SOURCE` con l’export corrispondente; compila il kernel storico separato
+quando quello corrente è cambiato, senza allargare il bridge di compatibilità.
+
 ## Riproduzione
 
 Sul target Linux/Level Zero, con il modello già disponibile:

@@ -16,6 +16,8 @@ typedef struct {
 typedef struct {
     uint8_t key[32];
     uint64_t rebuild_cost;
+    kvstore_id group;
+    int has_group;
     int has_key;
     int pinned;
 } kvstore_save_options;
@@ -31,9 +33,18 @@ typedef enum {
     KVSTORE_PINNED
 } kvstore_status;
 
+/* Open does not evict. Restore legacy membership before enforcing a budget. */
 kvstore_status kvstore_open(kvstore **out, const char *directory,
                             uint64_t budget);
 void kvstore_close(kvstore *store);
+kvstore_status kvstore_set_group(kvstore *store, const kvstore_id *id,
+                                 const kvstore_id *group);
+/* Called only after the transcript durably references the new checkpoint.
+ * Optional eligibility filter excludes refs outside the current cache epoch. */
+typedef int (*kvstore_eligible_fn)(const kvstore_id *id, void *context);
+kvstore_status kvstore_committed(kvstore *store, const kvstore_id *id,
+                                  xe_session *session,
+                                  kvstore_eligible_fn eligible, void *context);
 
 kvstore_status kvstore_save(kvstore *store, xe_session *session,
                             const kvstore_save_options *options,
@@ -47,6 +58,7 @@ kvstore_status kvstore_load_input(kvstore *store, const kvstore_id *id,
                                   xe_snapshot_status *snapshot_status);
 kvstore_status kvstore_find(kvstore *store, const uint8_t key[32],
                             kvstore_id *id);
+kvstore_status kvstore_contains(kvstore *store, const kvstore_id *id);
 kvstore_status kvstore_remove(kvstore *store, const kvstore_id *id);
 
 kvstore_status kvstore_anchor_get(kvstore *store, const char *name,

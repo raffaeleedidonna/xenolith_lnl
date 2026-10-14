@@ -5,6 +5,7 @@
 #include "profile.h"
 #include "conversation.h"
 #include "serve.h"
+#include "kvstore.h"
 
 #include <errno.h>
 #include <inttypes.h>
@@ -31,12 +32,39 @@ static void usage(void) {
 "  chat     [-n max] [--temp F] [--top-k N] [--top-p F] [--seed S]\n"
 "  oracle   -t \"id,id,id\" [-o logits.bin] [--layers dir] [--q8]\n"
 "  bench    [-p N] [-n N] [-d N] [-r N] [--delay S] [--no-warmup] [--progress] [-o md|jsonl]\n"
-"  wire     [--state DIR] [--cache DIR] [--mmproj FILE]\n"
-"  serve    [--state DIR] [--cache DIR] [--socket PATH] [--idle-shutdown MIN] [--mmproj FILE]\n");
+"  wire     [--state DIR] [--cache DIR] [--cache-budget SIZE] [--mmproj FILE]\n"
+"  serve    [--state DIR] [--cache DIR] [--cache-budget SIZE] [--socket PATH] [--idle-shutdown MIN] [--mmproj FILE]\n"
+"           SIZE: bytes, kB/MB/GB or KiB/MiB/GiB; default 16GiB; 0 disables disk cache\n");
     exit(1);
 }
 
 static int cli_lock_fd = -1;
+
+static int cli_parse_cache_budget(const char *text, uint64_t *out) {
+    if (!text || !*text || !out) return 0;
+    const unsigned char *p = (const unsigned char *)text;
+    uint64_t value = 0;
+    if (*p < '0' || *p > '9') return 0;
+    do {
+        unsigned digit = (unsigned)(*p - '0');
+        if (value > (UINT64_MAX - digit) / 10) return 0;
+        value = value * 10 + digit;
+        p++;
+    } while (*p >= '0' && *p <= '9');
+
+    uint64_t multiplier = 1;
+    if (!*p || strcmp((const char *)p, "B") == 0) multiplier = 1;
+    else if (strcmp((const char *)p, "kB") == 0) multiplier = UINT64_C(1000);
+    else if (strcmp((const char *)p, "MB") == 0) multiplier = UINT64_C(1000000);
+    else if (strcmp((const char *)p, "GB") == 0) multiplier = UINT64_C(1000000000);
+    else if (strcmp((const char *)p, "KiB") == 0) multiplier = UINT64_C(1024);
+    else if (strcmp((const char *)p, "MiB") == 0) multiplier = UINT64_C(1048576);
+    else if (strcmp((const char *)p, "GiB") == 0) multiplier = UINT64_C(1073741824);
+    else return 0;
+    if (value > UINT64_MAX / multiplier) return 0;
+    *out = value * multiplier;
+    return 1;
+}
 
 static void cli_state_dir(const char *override, char *out, size_t cap) {
     if (override) {
@@ -1170,6 +1198,7 @@ static int cmd_wire(const char *model, int argc, char **argv) {
     const char *state_option = NULL;
     const char *mmproj = NULL;
     const char *cache_dir = NULL;
+    uint64_t cache_budget = KVSTORE_DEFAULT_BUDGET;
     for (int i = 3; i < argc; i++) {
         if (cli_context_option(argc, argv, &i, &context, &context_seen)) continue;
         if (!strcmp(argv[i],"--mmproj")) {
@@ -1181,6 +1210,8 @@ static int cmd_wire(const char *model, int argc, char **argv) {
         } else if (!strcmp(argv[i], "--cache")) {
             if (++i >= argc) usage();
             cache_dir = argv[i];
+        } else if (!strcmp(argv[i], "--cache-budget")) {
+            if (++i >= argc || !cli_parse_cache_budget(argv[i], &cache_budget)) usage();
         } else {
             usage();
         }
@@ -1193,7 +1224,7 @@ static int cmd_wire(const char *model, int argc, char **argv) {
 
     xe_engine *e = xe_engine_open_with_context(model, context);
     if(mmproj){char error[256];if(!xe_engine_enable_vision(e,mmproj,error,sizeof error)){fprintf(stderr,"xenolith: %s\n",error);xe_engine_close(e);cli_unlock();return 1;}}
-    int status = serve_stdio(e, state_dir, cache_dir);
+    int status = serve_stdio_with_budget(e, state_dir, cache_dir, cache_budget);
     xe_engine_close(e);
     cli_unlock();
     return status;
@@ -1204,6 +1235,7 @@ static int cmd_serve(const char *model, int argc, char **argv) {
     const char *state_option = NULL;
     const char *mmproj = NULL;
     const char *cache_dir = NULL;
+    uint64_t cache_budget = KVSTORE_DEFAULT_BUDGET;
     const char *socket_option = NULL;
     double idle_minutes = 0.0;
     for (int i = 3; i < argc; i++) {
@@ -1217,6 +1249,8 @@ static int cmd_serve(const char *model, int argc, char **argv) {
         } else if (!strcmp(argv[i], "--cache")) {
             if (++i >= argc) usage();
             cache_dir = argv[i];
+        } else if (!strcmp(argv[i], "--cache-budget")) {
+            if (++i >= argc || !cli_parse_cache_budget(argv[i], &cache_budget)) usage();
         } else if (!strcmp(argv[i], "--socket")) {
             if (++i >= argc) usage();
             socket_option = argv[i];
@@ -1245,8 +1279,8 @@ static int cmd_serve(const char *model, int argc, char **argv) {
 
     xe_engine *e = xe_engine_open_with_context(model, context);
     if(mmproj){char error[256];if(!xe_engine_enable_vision(e,mmproj,error,sizeof error)){fprintf(stderr,"xenolith: %s\n",error);xe_engine_close(e);cli_unlock();return 1;}}
-    int status = serve_run(e, state_dir, cache_dir, socket_path,
-                           idle_minutes);
+    int status = serve_run_with_budget(e, state_dir, cache_dir, socket_path,
+                           idle_minutes, cache_budget);
     xe_engine_close(e);
     cli_unlock();
     return status;

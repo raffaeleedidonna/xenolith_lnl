@@ -19,8 +19,11 @@ Or use stdin for requests and stdout for replies:
 ./xenolith wire /path/to/model.gguf
 ```
 
-Both commands accept `--state DIR` and `--cache DIR`. `serve` also accepts
-`--idle-shutdown MINUTES`, a positive number; by default it stays running.
+Both commands accept `--state DIR`, `--cache DIR` and `--cache-budget SIZE`
+(default `16GiB`). The budget accepts integer bytes or a `B`, `kB`, `MB`, `GB`,
+`KiB`, `MiB` or `GiB` suffix; `0` disables disk cache reads and writes without
+removing existing files. `serve` also accepts `--idle-shutdown MINUTES`, a
+positive number; by default it stays running.
 Use absolute directory paths; the parent of an explicit socket path must exist.
 Without `--socket`, the socket is `$XDG_RUNTIME_DIR/xenolith/wire.sock` when
 available, otherwise `wire.sock` inside the state directory. Default state and
@@ -216,7 +219,9 @@ images are not persisted and do not create retrievable media IDs.
 The conversation retains original image bytes, preprocessing metadata and
 model fingerprints, so deleting the original file or derived embedding cache
 does not lose the image. Derived embeddings live in `CACHE/vision-v1`, with
-a 2 GiB eviction budget. Their identity includes content, resized pixels,
+a separate 2 GiB eviction budget; `--cache-budget` bounds KV checkpoints and
+shared segments. `--cache-budget 0` disables both disk caches without deleting
+their files or transcript media. Their identity includes content, resized pixels,
 budget, both weight fingerprints, source/compiler/SPIR-V fingerprints, GPU identity,
 driver version and the compiled native GPU module. Visual KV snapshots bind
 the complete mixed input and numerical fingerprint. A mismatch triggers replay;
@@ -385,9 +390,30 @@ An explicit checkpoint reply, or optional `done.checkpoint`, contains `saved`,
 `saved: false` is a checkpoint outcome, not a failed generation. The durable
 transcript remains the source of truth; a later request may need to recompute KV.
 
+Checkpoints share global KV data and are recycled within the configured budget.
+The least recently used conversation is first reduced to an earlier reserve;
+if more space is needed, its remaining cache is removed. Transcripts are kept.
+Existing points of the conversation being saved stay protected until the new
+checkpoint and its reference are durable. If it cannot fit, saving is skipped
+with reason `budget` and those points are preserved.
+
 Optional `done.resume` contains `loaded`, `tokens`, and `reason` when loading
 failed: `evicted`, `model_mismatch`, `token_mismatch`, `io` or `rejected`.
-Its token count is the snapshot boundary loaded or attempted.
+Its token count is the snapshot boundary loaded or attempted. If the latest
+point is missing or rejected, restoration tries earlier compatible points in
+the current cache epoch before rebuilding. Resuming an earlier point requires
+prefill for the remaining transcript.
+
+Text snapshots use upstream format v2 and its stable numerical ABI. The audited
+v1 bridge for `68b8fbf55` requires the same compiled kernel and numerical settings;
+this vision build's changed kernel does not qualify, so those snapshots replay
+their transcript. Other v1 producers remain unsupported.
+
+Visual snapshots use format v3 with a mixed-input identity and numerical ABI.
+The earlier visual-v2 format is recognized separately from text-v2 and falls
+back to media replay. Prefix validation includes image content, budget and
+complete-image boundaries. Incompatible cache never discards the transcript or
+source media. Older engines cannot read the new visual checkpoint format.
 
 ## History and rewinding
 

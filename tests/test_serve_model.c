@@ -233,11 +233,17 @@ int main(int argc, char **argv) {
     CHECK(mkdtemp(root) != NULL);
     signal(SIGPIPE, SIG_IGN);
 
-    char state_dir[256], cache_dir[256], socket_path[256], log_path[256];
+    char state_dir[256], cache_dir[4096], socket_path[256], log_path[256];
     char runtime_dir[256], state_home[256];
     char other_state[256], other_socket[256];
     snprintf(state_dir, sizeof state_dir, "%s/state", root);
-    snprintf(cache_dir, sizeof cache_dir, "%s/cache", root);
+    const char *cache_tmp = getenv("TMPDIR");
+    if (cache_tmp && *cache_tmp) {
+        CHECK(snprintf(cache_dir, sizeof cache_dir, "%s/xenolith-serve-cache-XXXXXX", cache_tmp) < (int)sizeof cache_dir);
+        CHECK(mkdtemp(cache_dir) != NULL);
+    } else {
+        snprintf(cache_dir, sizeof cache_dir, "%s/cache", root);
+    }
     snprintf(socket_path, sizeof socket_path, "%s/wire.sock", root);
     snprintf(log_path, sizeof log_path, "%s/serve.log", root);
     snprintf(runtime_dir, sizeof runtime_dir, "%s/run", root);
