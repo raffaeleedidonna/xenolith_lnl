@@ -1,8 +1,8 @@
 /* Included by xenolith.c: uses the existing Level Zero owner and allocator. */
 static ze_kernel_handle_t xe_vision_kernel(xe_engine *e, int index) {
-    static const char *names[8] = {
+    static const char *names[7] = {
         "xe_vision_dense", "xe_vision_norm", "xe_vision_head", "xe_vision_attention",
-        "xe_vision_add", "xe_vision_geglu", "xe_vision_pool", "xe_prefill_attn_online_b8_swa_visual"
+        "xe_vision_add", "xe_vision_geglu", "xe_vision_pool"
     };
     if (!e->gpu.vision[index]) {
         ze_kernel_desc_t desc = { .stype=ZE_STRUCTURE_TYPE_KERNEL_DESC, .pKernelName=names[index] };
@@ -329,10 +329,9 @@ int xe_session_sync_input_report(xe_session *s,const xe_input *in,xe_sync_report
             if(visual<in->visual_count&&n>in->visual[visual].start-start)n=in->visual[visual].start-start;
             if(n>s->text_prefill_rows)n=s->text_prefill_rows;
         }
-        s->visual_batch=embedding!=NULL;
-        xe_prefill_batch_append_input(s,in->tokens+start,n,start,embedding);
+        xe_attention_mode mode=embedding?XE_ATTENTION_VISUAL:XE_ATTENTION_CAUSAL;
+        xe_prefill_batch_append_input(s,in->tokens+start,n,start,embedding,mode);
         xe_vision_wait(s->engine);xe_prefill_batch_complete(s,start+n==in->count);
-        s->visual_batch=0;
     }
     xe_session_swa_mirror(s,initial,s->n_tokens);
     s->visual_context=next;s->visual_prompt_end=in->count;xe_input_hash(in,s->visual_prompt_hash);

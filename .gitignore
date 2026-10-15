@@ -53,6 +53,7 @@
 /tests/test_model_decode
 /tests/test_prefill_dense
 /tests/test_prefill_layer
+/tests/test_prefill_host
 /tests/test_prefill_projection
 /tests/test_prefill_qkv
 /tests/test_prefill_session

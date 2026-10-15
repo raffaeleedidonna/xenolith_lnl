@@ -130,6 +130,11 @@ typedef struct {
     int n;
 } xe_q8;
 
+typedef enum {
+    XE_ATTENTION_CAUSAL,
+    XE_ATTENTION_VISUAL
+} xe_attention_mode;
+
 typedef struct {
     int32_t id;
     float logit;
@@ -196,6 +201,7 @@ typedef struct {
     ze_kernel_handle_t prefill_attn_online_b8_global_shared;
     ze_kernel_handle_t prefill_attn_online_b8_global_cow;
     ze_kernel_handle_t prefill_attn_online_b8_swa;
+    ze_kernel_handle_t prefill_attn_online_b8_swa_visual;
     ze_kernel_handle_t prefill_heads_q8;
     ze_kernel_handle_t prefill_rms_residual;
     ze_kernel_handle_t prefill_swa_stage;
@@ -218,12 +224,11 @@ typedef struct {
     ze_kernel_handle_t prefill_expert_geglu_q8;
     ze_kernel_handle_t prefill_route_reduce;
     ze_kernel_handle_t prefill_ffn_finish;
-    ze_kernel_handle_t vision[8];
+    ze_kernel_handle_t vision[7];
 } xe_gpu;
 
 struct xe_engine {
     int context;
-    int visual_attention;
     xe_vision_model vision_model;
     void *vision_weights;
     uint8_t vision_numeric_hash[32];
@@ -332,7 +337,6 @@ struct xe_session {
     int prefill_capacity;
     int text_prefill_rows;
     xe_visual_context *visual_context;
-    int visual_batch;
     int visual_prompt_end;
     uint8_t visual_prompt_hash[32];
     float *hidden;
@@ -753,9 +757,12 @@ static void xe_gpu_destroy(xe_engine *e) {
     if (e->gpu.commands)
         xe_ze_check("zeCommandListHostSynchronize close",
                     zeCommandListHostSynchronize(e->gpu.commands, UINT64_MAX));
-    for (int i = 0; i < 8; i++)
+    for (size_t i = 0; i < sizeof e->gpu.vision / sizeof *e->gpu.vision; i++)
         if (e->gpu.vision[i])
             xe_ze_check("zeKernelDestroy vision", zeKernelDestroy(e->gpu.vision[i]));
+    if (e->gpu.prefill_attn_online_b8_swa_visual)
+        xe_ze_check("zeKernelDestroy prefill visual attention",
+                    zeKernelDestroy(e->gpu.prefill_attn_online_b8_swa_visual));
     if (e->gpu.prefill_ffn_finish)
         xe_ze_check("zeKernelDestroy prefill ffn finish",
                     zeKernelDestroy(e->gpu.prefill_ffn_finish));
@@ -1018,15 +1025,31 @@ static void __attribute__((unused)) xe_prefill_qkv_append(
                                                 &groups, NULL, 0, NULL));
 }
 
-static ze_kernel_handle_t xe_vision_kernel(xe_engine *e, int index);
+static ze_kernel_handle_t xe_prefill_visual_attention_kernel(xe_engine *e) {
+    if (!e->gpu.prefill_attn_online_b8_swa_visual) {
+        ze_kernel_desc_t desc = {
+            .stype = ZE_STRUCTURE_TYPE_KERNEL_DESC,
+            .pKernelName = "xe_prefill_attn_online_b8_swa_visual"
+        };
+        xe_ze_check("zeKernelCreate prefill visual attention",
+                    zeKernelCreate(e->gpu.module, &desc,
+                                   &e->gpu.prefill_attn_online_b8_swa_visual));
+        xe_ze_check("zeKernelSetGroupSize prefill visual attention",
+                    zeKernelSetGroupSize(e->gpu.prefill_attn_online_b8_swa_visual,
+                                         128, 1, 1));
+    }
+    return e->gpu.prefill_attn_online_b8_swa_visual;
+}
 
 static void __attribute__((unused)) xe_prefill_attention_online_append(
         xe_engine *e, const float *q, const _Float16 *k, const _Float16 *v,
         float *output, int rows, int keys, int dimension, int kv_heads,
-        int query_offset, int window) {
+        int query_offset, int window, xe_attention_mode mode) {
+    /* Global decoder layers remain causal for visual batches too. */
     ze_kernel_handle_t kernel = dimension == 256
-                                ? e->visual_attention ? xe_vision_kernel(e, 7)
-                                                      : e->gpu.prefill_attn_online_b8_swa
+                                ? mode == XE_ATTENTION_VISUAL
+                                  ? xe_prefill_visual_attention_kernel(e)
+                                  : e->gpu.prefill_attn_online_b8_swa
                                 : e->gpu.prefill_attn_online_b8_global_shared;
     xe_gpu_pointer_arg(kernel, 0, q);
     xe_gpu_pointer_arg(kernel, 1, k);
@@ -1991,14 +2014,14 @@ static void xe_prefill_attention_project_append(
 static void xe_prefill_attention_output_append(
         xe_engine *e, int layer_index, xe_prefill_workspace *w, int rows,
         const _Float16 *k, const _Float16 *v, int keys, int query_offset,
-        int window) {
+        int window, xe_attention_mode mode) {
     int global = XE_IS_GLOBAL(layer_index);
     int dimension = global ? XE_GLOBAL_HEAD_DIM : XE_SWA_HEAD_DIM;
     int kv_heads = global ? XE_GLOBAL_KV_HEADS : XE_SWA_KV_HEADS;
     xe_prefill_attention_online_append(e, w->q_heads, k, v,
                                         w->attention_heads, rows, keys,
                                         dimension, kv_heads, query_offset,
-                                        window);
+                                        window, mode);
     xe_prefill_attention_project_append(e, layer_index, w, rows);
 }
 
@@ -2007,12 +2030,12 @@ static void xe_prefill_attention_prepared_append(
     xe_prefill_attention_qkv_append(e, layer_index, w, rows);
     xe_prefill_attention_output_append(
         e, layer_index, w, rows, w->k_batch, w->v_batch, rows, 0,
-        XE_IS_GLOBAL(layer_index) ? 0 : XE_SWA_WINDOW);
+        XE_IS_GLOBAL(layer_index) ? 0 : XE_SWA_WINDOW, XE_ATTENTION_CAUSAL);
 }
 
 static void xe_prefill_attention_batch_append(
         xe_session *s, int layer_index, xe_prefill_workspace *w, int rows,
-        int batch_start) {
+        int batch_start, xe_attention_mode mode) {
     xe_engine *e = s->engine;
     int global = XE_IS_GLOBAL(layer_index);
     int dimension = global ? XE_GLOBAL_HEAD_DIM : XE_SWA_HEAD_DIM;
@@ -2039,7 +2062,7 @@ static void xe_prefill_attention_batch_append(
     } else if (batch_start == 0) {
         xe_prefill_attention_output_append(
             e, layer_index, w, rows, w->k_batch, w->v_batch, rows, 0,
-            global ? 0 : XE_SWA_WINDOW);
+            global ? 0 : XE_SWA_WINDOW, mode);
         if (global)
             xe_prefill_linear_commit_append(e, cache_k, cache_v, w->k_batch,
                                             w->v_batch, rows, batch_start,
@@ -2054,7 +2077,7 @@ static void xe_prefill_attention_batch_append(
                                         dimension, kv_heads, capacity);
         xe_prefill_attention_output_append(
             e, layer_index, w, rows, cache_k, cache_v, capacity,
-            batch_start, 0);
+            batch_start, 0, mode);
     } else {
         int stage_base = batch_start >= XE_SWA_WINDOW - 1
                          ? batch_start - (XE_SWA_WINDOW - 1) : 0;
@@ -2064,7 +2087,7 @@ static void xe_prefill_attention_batch_append(
                                     batch_start, stage_base, stage_count);
         xe_prefill_attention_output_append(
             e, layer_index, w, rows, w->k_stage, w->v_stage, stage_count,
-            batch_start - stage_base, XE_SWA_WINDOW);
+            batch_start - stage_base, XE_SWA_WINDOW, mode);
         xe_prefill_swa_commit_append(e, cache_k, cache_v, w->k_batch,
                                      w->v_batch, rows, batch_start,
                                      dimension, kv_heads, capacity);
@@ -4967,7 +4990,8 @@ static void xe_output_decode(xe_session *s, int softcap_mode) {
 
 static void xe_prefill_batch_append_input(xe_session *s,
                                         const int32_t *tokens,
-                                        int rows, int batch_start, const float *visual) {
+                                        int rows, int batch_start, const float *visual,
+                                        xe_attention_mode mode) {
     if (rows < 1 || rows > s->prefill_capacity)
         xe_fatal("prefill batch exceeds workspace capacity");
     if (s->prefill_pending)
@@ -4987,9 +5011,8 @@ static void xe_prefill_batch_append_input(xe_session *s,
         xe_embed_decode(e, tokens[row], w.hidden[0] + (size_t)row * XE_EMBD);
     xe_prefill_rope_prepare_batch(e, &w, rows, batch_start, 0);
     xe_prefill_rope_prepare_batch(e, &w, rows, batch_start, 1);
-    e->visual_attention = s->visual_batch;
     for (int layer = 0; layer < XE_LAYERS; layer++) {
-        xe_prefill_attention_batch_append(s, layer, &w, rows, batch_start);
+        xe_prefill_attention_batch_append(s, layer, &w, rows, batch_start, mode);
         for (int start = 0; start < rows; start += 512) {
             int tile_rows = rows - start;
             if (tile_rows > 512) tile_rows = 512;
@@ -5002,7 +5025,6 @@ static void xe_prefill_batch_append_input(xe_session *s,
         w.hidden[0] = w.hidden[1];
         w.hidden[1] = hidden;
     }
-    e->visual_attention = 0;
     memcpy(s->tokens + batch_start, tokens, (size_t)rows * sizeof(*tokens));
     s->prefill_pending = 1;
     s->prefill_pending_start = batch_start;
@@ -5013,7 +5035,8 @@ static void xe_prefill_batch_append_input(xe_session *s,
 
 static void xe_prefill_batch_append_run(xe_session *s, const int32_t *tokens,
                                        int rows, int batch_start) {
-    xe_prefill_batch_append_input(s, tokens, rows, batch_start, NULL);
+    xe_prefill_batch_append_input(s, tokens, rows, batch_start, NULL,
+                                 XE_ATTENTION_CAUSAL);
 }
 
 static void xe_prefill_batch_complete(xe_session *s, int output_logits) {

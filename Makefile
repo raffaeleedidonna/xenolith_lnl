@@ -41,7 +41,7 @@ clean:
 		tests/test_kvstore tests/test_conversation \
 		tests/test_conversation_model \
 		tests/test_json tests/test_profile tests/test_inference tests/test_runtime \
-		tests/test_runtime_model tests/test_serve tests/test_serve_model tests/test_gpu_alloc tests/test_cli_context \
+		tests/test_runtime_model tests/test_serve tests/test_serve_model tests/test_gpu_alloc tests/test_prefill_host tests/test_cli_context \
 		bench/bench_attention bench/bench_tg bench/bench_b3b bench/bench_b3b_8e \
 		bench/bench_guard bench/compare_pp_tg_xe bench/compare_pp_tg_tokens \
 		bench/bench_b3b.spv bench/bench_b3b_adlp.spv \
@@ -66,7 +66,7 @@ LLAMA_LDLIBS=-lllama -lggml -lggml-base
 
 TEST_CFLAGS=-O2 -std=c11 -Wall -Wextra -pthread
 
-UNIT_TESTS=tests/test_inference tests/test_format tests/test_sha256 tests/test_json tests/test_decode tests/test_conversation tests/test_gpu_alloc tests/test_context_limits tests/test_visual_cache tests/test_visual_replay
+UNIT_TESTS=tests/test_inference tests/test_format tests/test_sha256 tests/test_json tests/test_decode tests/test_conversation tests/test_gpu_alloc tests/test_prefill_host tests/test_context_limits tests/test_visual_cache tests/test_visual_replay
 GPU_TESTS=tests/test_kv tests/test_snapshot tests/test_kvstore tests/test_prefill_session
 PERSISTENCE_TESTS=tests/test_cache_model tests/test_snapshot_model tests/test_conversation_model tests/test_session_sync
 PREFILL_TESTS=tests/test_prefill_projection tests/test_prefill_qkv tests/test_prefill_swa \
@@ -78,7 +78,7 @@ ENGINE_TESTS=tests/test_snapshot tests/test_snapshot_model tests/test_kvstore \
 
 tests/test_inference tests/test_context_limits: vision_runtime.inc vision_serve.inc
 
-$(ENGINE_TESTS) tests/test_context_limits tests/test_gpu_alloc: xenolith_internal.h format.h $(NUMERIC_SOURCES)
+$(ENGINE_TESTS) tests/test_context_limits tests/test_gpu_alloc tests/test_prefill_host: xenolith_internal.h format.h $(NUMERIC_SOURCES)
 tests/test_prefill_session tests/test_prefill_session_drop tests/test_prefill_session_safe \
     tests/test_kv_model tests/test_snapshot_model tests/test_session_sync tests/test_runtime_model \
     tests/test_conversation_model tests/test_serve_model: tests/test_context.h
@@ -94,7 +94,7 @@ ORACLE_PROMPTS=short long
 tests/certify: tests/certify.c xenolith.o format.o vision.o profile.o json.o xenolith.h profile.h $(GPU_OBJ)
 	$(CC) $(TEST_CFLAGS) -I. -o $@ tests/certify.c xenolith.o format.o vision.o profile.o json.o $(GPU_OBJ) $(LDLIBS)
 
-tests/test_gpu_alloc: tests/test_gpu_alloc.c xenolith.c xenolith.h xenolith_internal.h format.h
+tests/test_gpu_alloc tests/test_prefill_host: %: %.c xenolith.c xenolith.h xenolith_internal.h format.h
 	$(CC) $(CFLAGS) -ffunction-sections -fdata-sections -I. -o $@ $< \
 		-Wl,--gc-sections -lm
 
