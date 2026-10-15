@@ -151,6 +151,7 @@ static void runtime_visual_prune(runtime *w) {
 
 static runtime_status runtime_visual_asset_get(runtime *w,const xe_image *meta,
                                   const uint8_t *media,size_t size,const uint8_t *record,
+                                  const xe_image *prepared,
                                   runtime_visual_asset **out) {
     /* Original media remain valid across weight changes; only compare derived
      * rows with the old record when both weights and numerical identity match. */
@@ -174,20 +175,26 @@ static runtime_status runtime_visual_asset_get(runtime *w,const xe_image *meta,
     if(!a->embeddings||!a->media){runtime_visual_asset_free(a);return runtime_fail(w,RUNTIME_NOMEM,"out of memory");}
     memcpy(a->media,media,size);
     if(!runtime_visual_cache_read(w,meta,a)) {
-        xe_image im;char error[256];
-        if(!xe_image_load_memory(&im,media,size,meta->budget,error,sizeof error)) {
+        /* Prepared pixels are borrowed only for this call. Replay owns its
+         * local preprocessing and must still check it against stored metadata. */
+        xe_image local;char error[256];
+        const xe_image *im=prepared;
+        if(!im && !xe_image_load_memory(&local,media,size,meta->budget,error,sizeof error)) {
             runtime_visual_asset_free(a);return runtime_fail(w,RUNTIME_INVALID_ARGUMENT,"invalid stored image");
         }
-        int same=im.rows==meta->rows&&im.width==meta->width&&im.height==meta->height&&
-            im.resized_width==meta->resized_width&&im.resized_height==meta->resized_height&&
-            !memcmp(im.rgb_hash,meta->rgb_hash,32)&&!memcmp(im.resized_hash,meta->resized_hash,32)&&
-            !memcmp(im.encoded_hash,meta->encoded_hash,32);
+        if(!im)im=&local;
+        int same=im->rows==meta->rows&&im->width==meta->width&&im->height==meta->height&&
+            im->resized_width==meta->resized_width&&im->resized_height==meta->resized_height&&
+            !memcmp(im->rgb_hash,meta->rgb_hash,32)&&!memcmp(im->resized_hash,meta->resized_hash,32)&&
+            !memcmp(im->encoded_hash,meta->encoded_hash,32);
         if(!same) {
-            xe_image_free(&im);runtime_visual_asset_free(a);
+            if(!prepared)xe_image_free(&local);
+            runtime_visual_asset_free(a);
             return runtime_fail(w,RUNTIME_INVALID_ARGUMENT,"image preprocessing changed; rebuild required");
         }
         runtime_shadow_drop(w);
-        int encoded=xe_engine_encode_image(w->engine,&im,a->embeddings,NULL);xe_image_free(&im);
+        int encoded=xe_engine_encode_image(w->engine,im,a->embeddings,NULL);
+        if(!prepared)xe_image_free(&local);
         if(!encoded){runtime_visual_asset_free(a);return runtime_fail(w,RUNTIME_INVALID_ARGUMENT,"image encoding failed");}
         xe_visual_identity(meta,xe_engine_model_fingerprint(w->engine),xe_engine_vision_fingerprint(w->engine),
                            a->embeddings,XE_VISION_NUMERIC_REVISION,a->identity);
@@ -238,7 +245,7 @@ static runtime_status runtime_visual_collect(runtime *w,conversation *c) {
                boundary<previous||(uint64_t)offset+meta.rows>boundary-previous)
                 return runtime_fail(w,RUNTIME_INVALID_ARGUMENT,"invalid image layout");
             const uint8_t *p=block->data;
-            runtime_visual_asset *asset;runtime_status status=runtime_visual_asset_get(w,&meta,media,size,p,&asset);
+            runtime_visual_asset *asset;runtime_status status=runtime_visual_asset_get(w,&meta,media,size,p,NULL,&asset);
             if(status!=RUNTIME_OK)return status;
             status=runtime_visual_push(w,asset,(int)previous+offset);if(status!=RUNTIME_OK)return status;
         }
@@ -322,7 +329,7 @@ static runtime_status runtime_visual_prepare(runtime *w,const runtime_message *m
     if(status!=RUNTIME_OK){xe_image_free(&im);return status;}
     runtime_shadow_drop(w);w->vision_touched=1;
     runtime_visual_asset *asset;
-    status=runtime_visual_asset_get(w,&im,message->image,message->image_length,NULL,&asset);
+    status=runtime_visual_asset_get(w,&im,message->image,message->image_length,NULL,&im,&asset);
     if(status!=RUNTIME_OK){xe_image_free(&im);return status;}
     size_t bytes=RT_IMAGE_HEADER+message->image_length;uint8_t *p=calloc(1,bytes);
     if(!p){xe_image_free(&im);return runtime_fail(w,RUNTIME_NOMEM,"out of memory");}
