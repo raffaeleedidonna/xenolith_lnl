@@ -94,8 +94,12 @@ ORACLE_PROMPTS=short long
 tests/certify: tests/certify.c xenolith.o format.o vision.o profile.o json.o xenolith.h profile.h $(GPU_OBJ)
 	$(CC) $(TEST_CFLAGS) -I. -o $@ tests/certify.c xenolith.o format.o vision.o profile.o json.o $(GPU_OBJ) $(LDLIBS)
 
-tests/test_gpu_alloc tests/test_prefill_host: %: %.c xenolith.c xenolith.h xenolith_internal.h format.h
+tests/test_gpu_alloc: tests/test_gpu_alloc.c xenolith.c xenolith.h xenolith_internal.h format.h
 	$(CC) $(CFLAGS) -ffunction-sections -fdata-sections -I. -o $@ $< \
+		-Wl,--gc-sections -lm
+
+tests/test_prefill_host: tests/test_prefill_host.c xenolith.c xenolith.h xenolith_internal.h format.h
+	$(CC) $(CFLAGS) -ffunction-sections -fdata-sections -I. -o $@ $< vision.c \
 		-Wl,--gc-sections -lm
 
 tests/test_cli_context: tests/test_cli_context.c xenolith.h xenolith

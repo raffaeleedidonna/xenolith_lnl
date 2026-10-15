@@ -68,6 +68,7 @@ size_t xe_test_output_calls;
 #define XE_EXPERTS 128
 #define XE_EXPERTS_USED 8
 #define XE_EXPERT_FFN 704
+#define XE_PREFILL_FFN_MAX_ROWS 512
 #define XE_SWA_WINDOW 1024
 #define XE_SWA_KV_HEADS 8
 #define XE_SWA_HEAD_DIM 256
@@ -1820,6 +1821,7 @@ static void xe_workspace_q8(xe_workspace_arena *a, xe_q8 *q, int n) {
 
 typedef struct {
     int capacity;
+    int ffn_capacity;
     float *hidden[2];
     float *row_scale;
     xe_q8 attention_input;
@@ -1862,7 +1864,10 @@ static _Float16 *xe_kv_layer_ptr(xe_session *s, int layer, int value);
 static size_t xe_prefill_workspace_layout_rows(
         xe_prefill_workspace *w, void *base, int rows) {
     w->capacity = rows;
-    const int routes = rows * XE_EXPERTS_USED;
+    const int ffn_rows = rows < XE_PREFILL_FFN_MAX_ROWS
+                         ? rows : XE_PREFILL_FFN_MAX_ROWS;
+    w->ffn_capacity = ffn_rows;
+    const int routes = ffn_rows * XE_EXPERTS_USED;
     const int q_width = XE_Q_HEADS * XE_GLOBAL_HEAD_DIM;
     const int kv_width = XE_SWA_KV_HEADS * XE_SWA_HEAD_DIM;
     const int stage_keys = XE_SWA_WINDOW + rows - 1;
@@ -1904,12 +1909,13 @@ static size_t xe_prefill_workspace_layout_rows(
         &a, (size_t)rows * XE_EMBD * sizeof(float));
     w->attention_output = xe_workspace_take(
         &a, (size_t)rows * XE_EMBD * sizeof(float));
-    xe_workspace_q8(&a, &w->dense_input, rows * XE_EMBD);
-    xe_workspace_q8(&a, &w->moe_input, rows * XE_EMBD);
+    /* FFN tiles run in order and share scratch across the full attention batch. */
+    xe_workspace_q8(&a, &w->dense_input, ffn_rows * XE_EMBD);
+    xe_workspace_q8(&a, &w->moe_input, ffn_rows * XE_EMBD);
     w->router_input = xe_workspace_take(
-        &a, (size_t)rows * XE_EMBD * sizeof(float));
+        &a, (size_t)ffn_rows * XE_EMBD * sizeof(float));
     w->router_logits = xe_workspace_take(
-        &a, (size_t)rows * XE_EXPERTS * sizeof(float));
+        &a, (size_t)ffn_rows * XE_EXPERTS * sizeof(float));
     w->route_expert = xe_workspace_take(
         &a, (size_t)routes * sizeof(int));
     w->route_weight = xe_workspace_take(
@@ -1927,19 +1933,19 @@ static size_t xe_prefill_workspace_layout_rows(
         &a, (size_t)routes * sizeof(int));
     xe_workspace_q8(&a, &w->packed_moe, routes * XE_EMBD);
     w->dense_gate = xe_workspace_take(
-        &a, (size_t)rows * XE_DENSE_FFN * sizeof(float));
+        &a, (size_t)ffn_rows * XE_DENSE_FFN * sizeof(float));
     w->dense_up = xe_workspace_take(
-        &a, (size_t)rows * XE_DENSE_FFN * sizeof(float));
-    xe_workspace_q8(&a, &w->dense_activation, rows * XE_DENSE_FFN);
+        &a, (size_t)ffn_rows * XE_DENSE_FFN * sizeof(float));
+    xe_workspace_q8(&a, &w->dense_activation, ffn_rows * XE_DENSE_FFN);
     w->dense_down = xe_workspace_take(
-        &a, (size_t)rows * XE_EMBD * sizeof(float));
+        &a, (size_t)ffn_rows * XE_EMBD * sizeof(float));
     w->expert_gate_up = xe_workspace_take(
         &a, (size_t)routes * 2 * XE_EXPERT_FFN * sizeof(float));
     xe_workspace_q8(&a, &w->expert_activation, routes * XE_EXPERT_FFN);
     w->expert_down = xe_workspace_take(
         &a, (size_t)routes * XE_EMBD * sizeof(float));
     w->moe_output = xe_workspace_take(
-        &a, (size_t)rows * XE_EMBD * sizeof(float));
+        &a, (size_t)ffn_rows * XE_EMBD * sizeof(float));
     return (a.pos + 63) & ~(size_t)63;
 }
 
@@ -2103,8 +2109,10 @@ static void __attribute__((unused)) xe_prefill_attention_initial_append(
 
 static void __attribute__((unused)) xe_prefill_ffn_append(
         xe_engine *e, int layer_index, xe_prefill_workspace *w, int rows) {
-    if (rows < 1 || rows > 512)
+    if (rows < 1 || rows > XE_PREFILL_FFN_MAX_ROWS)
         xe_fatal("prefill FFN supports M1 through M512");
+    if (rows > w->ffn_capacity)
+        xe_fatal("prefill FFN exceeds workspace capacity");
     const xe_layer *layer = &e->layers[layer_index];
     int wide = rows == 512;
     xe_prefill_rms_append(e, w->attention_output, w->row_scale,
@@ -5013,9 +5021,10 @@ static void xe_prefill_batch_append_input(xe_session *s,
     xe_prefill_rope_prepare_batch(e, &w, rows, batch_start, 1);
     for (int layer = 0; layer < XE_LAYERS; layer++) {
         xe_prefill_attention_batch_append(s, layer, &w, rows, batch_start, mode);
-        for (int start = 0; start < rows; start += 512) {
+        for (int start = 0; start < rows; start += XE_PREFILL_FFN_MAX_ROWS) {
             int tile_rows = rows - start;
-            if (tile_rows > 512) tile_rows = 512;
+            if (tile_rows > XE_PREFILL_FFN_MAX_ROWS)
+                tile_rows = XE_PREFILL_FFN_MAX_ROWS;
             xe_prefill_workspace tile = w;
             tile.attention_output += (size_t)start * XE_EMBD;
             tile.hidden[1] += (size_t)start * XE_EMBD;
