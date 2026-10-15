@@ -70,7 +70,7 @@ def main():
     with tempfile.TemporaryDirectory(prefix='xenolith-vision-weights-') as directory:
         tmp = Path(directory)
         wrapper = tmp / 'loader.c'
-        wrapper.write_text('''#include "vision.h"
+        wrapper.write_text('''#include "vision_internal.h"
 #include <string.h>
 int load(const char *path, unsigned char *hash) {
     xe_vision_model m; char error[256];

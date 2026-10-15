@@ -10,7 +10,7 @@ static int attention_case(xe_engine *e,int rows,int previous,xe_attention_mode m
     for(int head=0;head<8;head++)for(int key=0;key<keys;key++)for(int d=0;d<256;d++)
         v[((size_t)head*keys+key)*256+d]=(_Float16)((key%17)*0.125f+head*0.5f+d*0.0001f);
     xe_prefill_attention_online_append(e,q,k,v,out,rows,keys,256,8,previous,1024,mode);
-    xe_vision_wait(e);
+    xe_gpu_wait(e);
     double *prefix=calloc((size_t)8*256*(keys+1),sizeof(double));
     if(!prefix)return 0;
     for(int head=0;head<8;head++)for(int d=0;d<256;d++) {
@@ -42,7 +42,7 @@ static int ring_case(xe_engine *e,int rows,int start) {
     _Float16 *rk=xe_alloc(e,ring*2,XE_MEM_SHARED),*rv=xe_alloc(e,ring*2,XE_MEM_SHARED);
     for(size_t i=0;i<batch;i++)bk[i]=bv[i]=(_Float16)((i/256%rows)%1024);
     for(size_t i=0;i<ring;i++)rk[i]=rv[i]=(_Float16)-1;
-    xe_prefill_swa_commit_append(e,rk,rv,bk,bv,rows,start,256,8,1024);xe_vision_wait(e);
+    xe_prefill_swa_commit_append(e,rk,rv,bk,bv,rows,start,256,8,1024);xe_gpu_wait(e);
     int ok=1,first=rows>1024?rows-1024:0;
     for(int head=0;head<8;head++)for(int r=first;r<rows;r++)for(int d=0;d<256;d++) {
         size_t dest=((size_t)head*1024+((start+r)&1023))*256+d;

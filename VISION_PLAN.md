@@ -130,8 +130,8 @@ una modifica dentro un'immagine invalida il blocco a partire dal suo inizio.
 
 | Componente | Responsabilità |
 |---|---|
-| Nuovi `vision.c/.h` e kernel visuali | Lettura pesi, encoder, proiezione, buffer e diagnostica. |
-| Nuovo modulo immagini | PNG/JPEG, RGB, resize, patch e limiti prima delle allocazioni. |
+| `vision.c/.h`, `vision_encoder.c/.h`, `vision_internal.h` e kernel visuali | Immagini e loader CPU; encoder separato con risorse GPU dell’engine e descrittori privati. |
+| `vision.c` | PNG/JPEG, RGB, resize e limiti prima delle allocazioni. |
 | `xenolith.c`, API pubblica e interna | Sequenza mista, prefill visuale, maschere, identità del prefisso e snapshot. |
 | `profile.c/.h` | Parti ordinate, delimitatori del modello e mappa delle posizioni visuali. |
 | `runtime.c/.h` | Preparazione immagini, contabilizzazione del contesto, replay e generazione. |
@@ -278,9 +278,11 @@ I media restano riutilizzabili per replay dopo un cambio di modalità.
 
 - `vision.c/.h`: PNG/JPEG, EXIF, alpha su bianco, resize, inventario e loader
   bloccato al checkpoint selezionato; identità, sequenza mista e archivio media.
+- `vision_encoder.c/.h` e `vision_internal.h`: encoder compilato separatamente;
+  descrittori privati e risorse GPU prestate dall’unico engine.
 - `vision.cl`: encoder a 27 layer e proiettore F16/F32 nativi Level Zero,
   senza matrice completa degli score residenti.
-- `vision_gpu.inc` / `xenolith.c`: span interi fino a 1120, scratch visuale,
+- `xenolith.c`: span interi fino a 1120, scratch visuale,
   commit degli ultimi 1024, FFN in tile da 512 e default testo conservato.
 - `profile.c`, `main.c`: delimitatori reali, `vision-encode`, `run --image`
   e `chat --image` con un allegato iniziale e domande successive,

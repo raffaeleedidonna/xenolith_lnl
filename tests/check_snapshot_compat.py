@@ -79,6 +79,8 @@ def main():
             command += [ROOT / "tests" / fixture, source / "format.c"]
             if (source / "vision.c").is_file():
                 command += [source / "vision.c"]
+            if (source / "vision_encoder.c").is_file():
+                command += [source / "vision_encoder.c"]
             command += [kernel, "-Wl,--gc-sections", "-lm", "-lze_loader", "-o", output]
             run(command)
             return output

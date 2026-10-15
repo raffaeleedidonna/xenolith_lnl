@@ -4,6 +4,7 @@
 
 #include "xenolith.h"
 #include "xenolith_internal.h"
+#include "vision_encoder.h"
 #include "format.h"
 
 #include <errno.h>
@@ -225,7 +226,7 @@ typedef struct {
     ze_kernel_handle_t prefill_expert_geglu_q8;
     ze_kernel_handle_t prefill_route_reduce;
     ze_kernel_handle_t prefill_ffn_finish;
-    ze_kernel_handle_t vision[7];
+    xe_vision_gpu vision;
 } xe_gpu;
 
 struct xe_engine {
@@ -530,6 +531,14 @@ static xe_gpu_status xe_gpu_classify(uint32_t id) {
     }
 }
 
+void *xe_vision_alloc_shared(xe_engine *e, size_t bytes) {
+    return xe_alloc(e, bytes, XE_MEM_SHARED);
+}
+
+void xe_vision_free_shared(xe_engine *e, void *pointer) {
+    xe_free(e, pointer, XE_MEM_SHARED);
+}
+
 static xe_relaxed_limits xe_gpu_get_relaxed_limits(ze_driver_handle_t driver) {
     uint32_t count = 0;
     xe_ze_check("zeDriverGetExtensionProperties count",
@@ -629,6 +638,9 @@ static void xe_gpu_init(xe_engine *e) {
         xe_ze_fatal("zeModuleCreate", result);
     }
     if (log) xe_ze_check("zeModuleBuildLogDestroy", zeModuleBuildLogDestroy(log));
+
+    e->gpu.vision.module = e->gpu.module;
+    e->gpu.vision.commands = e->gpu.commands;
 
     const char *prefill_names[40] = {
         "xe_prefill_rms_scale",
@@ -758,9 +770,9 @@ static void xe_gpu_destroy(xe_engine *e) {
     if (e->gpu.commands)
         xe_ze_check("zeCommandListHostSynchronize close",
                     zeCommandListHostSynchronize(e->gpu.commands, UINT64_MAX));
-    for (size_t i = 0; i < sizeof e->gpu.vision / sizeof *e->gpu.vision; i++)
-        if (e->gpu.vision[i])
-            xe_ze_check("zeKernelDestroy vision", zeKernelDestroy(e->gpu.vision[i]));
+    for (size_t i = 0; i < sizeof e->gpu.vision.kernels / sizeof *e->gpu.vision.kernels; i++)
+        if (e->gpu.vision.kernels[i])
+            xe_ze_check("zeKernelDestroy vision", zeKernelDestroy(e->gpu.vision.kernels[i]));
     if (e->gpu.prefill_attn_online_b8_swa_visual)
         xe_ze_check("zeKernelDestroy prefill visual attention",
                     zeKernelDestroy(e->gpu.prefill_attn_online_b8_swa_visual));
@@ -889,6 +901,11 @@ static void xe_gpu_destroy(xe_engine *e) {
         xe_ze_check("zeCommandListDestroy", zeCommandListDestroy(e->gpu.commands));
     if (e->gpu.context) xe_ze_check("zeContextDestroy", zeContextDestroy(e->gpu.context));
     memset(&e->gpu, 0, sizeof e->gpu);
+}
+
+static void xe_gpu_wait(xe_engine *e) {
+    xe_ze_check("zeCommandListHostSynchronize",
+                zeCommandListHostSynchronize(e->gpu.commands, UINT64_MAX));
 }
 
 static void xe_gpu_pointer_arg(ze_kernel_handle_t kernel, uint32_t index,
@@ -4005,6 +4022,95 @@ xe_engine *xe_engine_open_vocab(const char *gguf_path) {
     return xe_open_common(gguf_path, 1, &c);
 }
 
+int xe_engine_enable_vision(xe_engine *e,const char *path,char *error,size_t cap) {
+    if(!e||e->vision_weights){if(error&&cap)snprintf(error,cap,"vision already open or engine missing");return 0;}
+    xe_worker_pool_init(e);
+    xe_require_owner(e);
+    /* Vocab-only CLI encoders have parsed metadata, but not tensor shapes. */
+    if (e->vocab_only && !e->header_len) {
+        if (format_get_u64le((const uint8_t *)e->map + 8) != XE_TENSOR_COUNT) {
+            if (error && cap) snprintf(error, cap, "vision language model tensor count mismatch");
+            return 0;
+        }
+        xe_cur c = {(const uint8_t *)e->map, e->map_len, e->tensor_directory_pos};
+        xe_bind_tensors(e, &c, "vision language model");
+        xe_check_complete(e, "vision language model");
+    }
+    const uint8_t *model_id = xe_engine_model_fingerprint(e);
+    if (!xe_vision_weights_reference(model_id, 0))
+        fprintf(stderr, "xenolith: vision language model differs from the reference weights; "
+                        "using its full content identity for cache isolation.\n");
+    xe_vision_model model;
+    if(!xe_vision_model_open(&model,path,error,cap))return 0;
+    if(!e->gpu.context)xe_gpu_init(e);
+    size_t bytes=model.mapping_size-model.data_offset;
+    e->vision_weights=xe_alloc(e,bytes,XE_MEM_SHARED);
+    memcpy(e->vision_weights,(const uint8_t *)model.mapping+model.data_offset,bytes);
+    for(size_t i=0;i<model.tensor_count;i++)model.tensors[i].data=(const uint8_t *)e->vision_weights+model.tensors[i].offset;
+    munmap(model.mapping,model.mapping_size);model.mapping=NULL;
+    e->vision_model=model;
+    /* Prepare this during startup too, before the first image request. */
+    uint8_t numeric[32];
+    if (!xe_engine_vision_numeric_fingerprint(e, numeric)) {
+        xe_free(e, e->vision_weights, XE_MEM_SHARED);e->vision_weights=NULL;
+        xe_vision_model_close(&e->vision_model);
+        if (error && cap) snprintf(error, cap, "cannot prepare vision numerical identity");
+        return 0;
+    }
+    return 1;
+}
+
+int xe_engine_encode_image(xe_engine *e, const xe_image *im, float *output,
+                            const char *dump) {
+    if (!e || !im || !output || !e->vision_weights || !im->resized ||
+        im->rows < 1 || im->rows > XE_VISUAL_MAX) return 0;
+    xe_require_owner(e);
+    return xe_vision_encode(e, &e->gpu.vision, &e->vision_model, im, output, dump);
+}
+
+const uint8_t *xe_engine_vision_fingerprint(const xe_engine *e) {
+    return e && e->vision_weights ? e->vision_model.sha256 : NULL;
+}
+
+int xe_engine_vision_artifacts_match(const xe_engine *e, const uint8_t model[32],
+                                    const uint8_t projector[32]) {
+    if (!e || !e->vision_weights || !e->model_content_hash_ready) return 0;
+    return model && projector &&
+           !memcmp(model, e->model_content_hash, 32) &&
+           !memcmp(projector, e->vision_model.sha256, 32);
+}
+
+int xe_engine_vision_numeric_fingerprint(xe_engine *e,uint8_t out[32]) {
+    if(!e||!e->gpu.context||!out)return 0;
+    xe_require_owner(e);
+    if(e->vision_numeric_hash_ready){memcpy(out,e->vision_numeric_hash,32);return 1;}
+    ze_device_properties_t device={.stype=ZE_STRUCTURE_TYPE_DEVICE_PROPERTIES};
+    ze_driver_properties_t driver={.stype=ZE_STRUCTURE_TYPE_DRIVER_PROPERTIES};
+    if(zeDeviceGetProperties(e->gpu.device,&device)!=ZE_RESULT_SUCCESS ||
+       zeDriverGetProperties(e->gpu.driver,&driver)!=ZE_RESULT_SUCCESS)return 0;
+    size_t native_size=0;
+    if(zeModuleGetNativeBinary(e->gpu.module,&native_size,NULL)!=ZE_RESULT_SUCCESS||!native_size)return 0;
+    uint8_t *native=malloc(native_size);if(!native)return 0;
+    if(zeModuleGetNativeBinary(e->gpu.module,&native_size,native)!=ZE_RESULT_SUCCESS){free(native);return 0;}
+    format_sha256 hash;format_sha256_init(&hash);
+    const char *domain="xenolith-visual-numeric-v4";
+    format_sha256_update(&hash,domain,strlen(domain));
+    format_sha256_update(&hash,XE_VISION_NUMERIC_REVISION,strlen(XE_VISION_NUMERIC_REVISION));
+    format_sha256_update(&hash,XE_NUMERIC_SOURCE_HASH,strlen(XE_NUMERIC_SOURCE_HASH));
+    format_sha256_update(&hash,XE_NUMERIC_CFLAGS_HASH,strlen(XE_NUMERIC_CFLAGS_HASH));
+    format_sha256_update(&hash,__VERSION__,strlen(__VERSION__));
+    format_sha256_update(&hash,_binary_xenolith_gpu_spv_start,
+                         (size_t)(_binary_xenolith_gpu_spv_end-_binary_xenolith_gpu_spv_start));
+    format_sha256_update(&hash,device.uuid.id,sizeof device.uuid.id);
+    /* Intel's driver UUID contains an initialization timestamp. It names a
+     * driver instance, not stable numerical behavior across restarts. Bind
+     * the actual compiled native module instead, including compiler changes. */
+    format_sha256_update(&hash,native,native_size);free(native);
+    uint8_t bytes[4];format_put_u32le(bytes,driver.driverVersion);
+    format_sha256_update(&hash,bytes,4);format_sha256_final(&hash,e->vision_numeric_hash);
+    e->vision_numeric_hash_ready=1;memcpy(out,e->vision_numeric_hash,32);return 1;
+}
+
 void xe_engine_close(xe_engine *e) {
     if (!e) return;
     xe_worker_pool_destroy(e);
@@ -5285,6 +5391,26 @@ static void xe_session_swa_repair(xe_session *s) {
     }
 }
 
+static int xe_session_prefill_reserve(xe_session *s,int rows) {
+    if(rows<=s->prefill_capacity)return 1;
+    if(rows>XE_VISUAL_MAX||s->cow||s->prefill_pending)return 0;
+    /* A live shadow borrows this workspace and owns both spare SWA slabs. */
+    if(!s->swa_spare_k||!s->swa_spare_v)return 0;
+    xe_prefill_workspace w;
+    size_t bytes=xe_prefill_workspace_layout_rows(&w,NULL,rows);
+    void *next=xe_alloc(s->engine,bytes,XE_MEM_SHARED);
+    xe_free(s->engine,s->prefill_workspace,XE_MEM_SHARED);
+    s->prefill_workspace=next;s->prefill_workspace_size=bytes;s->prefill_capacity=rows;
+    return 1;
+}
+
+int xe_session_set_text_prefill(xe_session *s,int rows) {
+    if(!s||(rows!=512&&rows!=1024)||s->n_tokens||s->prefill_pending||s->cow)return 0;
+    xe_require_owner(s->engine);
+    if(!xe_session_prefill_reserve(s,rows))return 0;
+    s->text_prefill_rows=rows;return 1;
+}
+
 xe_session *xe_session_new(xe_engine *e) {
     if (!e || e->context < XE_CONTEXT_MIN || e->context > XE_CONTEXT_MAX)
         xe_fatal("session: invalid engine context capacity");
@@ -5572,6 +5698,121 @@ void xe_session_sync_report(xe_session *s, const xe_tokens *prefix, xe_sync_repo
 
 void xe_session_sync(xe_session *s, const xe_tokens *prefix) {
     xe_session_sync_report(s, prefix, NULL);
+}
+
+static xe_visual_context *xe_visual_context_new(const xe_input *in) {
+    xe_visual_context *v=calloc(1,sizeof *v);
+    if (!v) return NULL;
+    if (!xe_input_copy(&v->owned,in)) { free(v);return NULL; }
+    v->references=1;return v;
+}
+
+static int xe_session_common_input_validated(const xe_session *s,const xe_input *in) {
+    int common=0,limit=in->count<s->n_tokens?in->count:s->n_tokens;
+    while(common<limit&&in->tokens[common]==s->tokens[common])common++;
+    const xe_input *old=s->visual_context?&s->visual_context->owned.input:NULL;
+    size_t i=0,j=0,n=old?old->visual_count:0;
+    while(i<n||j<in->visual_count) {
+        const xe_visual_span *a=i<n?old->visual+i:NULL,*b=j<in->visual_count?in->visual+j:NULL;
+        int first=a&&b?(a->start<b->start?a->start:b->start):a?a->start:b->start;
+        if(first>=common)break;
+        if(!a||!b||a->start!=b->start||a->rows!=b->rows||a->budget!=b->budget||
+           a->media_size!=b->media_size||memcmp(a->identity,b->identity,32)||
+           memcmp(a->embeddings,b->embeddings,(size_t)a->rows*XE_VISUAL_WIDTH*4)||
+           (a->media_size&&memcmp(a->media,b->media,a->media_size)))return first;
+        if(common<a->start+a->rows)return a->start;
+        i++;j++;
+    }
+    return common;
+}
+
+int xe_session_common_input(const xe_session *s,const xe_input *in) {
+    if(!s||!xe_input_valid(in,s->engine->context))return -1;
+    return xe_session_common_input_validated(s,in);
+}
+
+int xe_session_has_visual(const xe_session *s) {
+    return s && s->visual_context!=NULL;
+}
+
+int xe_session_sync_input_report(xe_session *s,const xe_input *in,xe_sync_report *report) {
+    if(!s||s->cow||s->prefill_pending||!xe_input_layout_valid(in,s->engine->context))return 0;
+    xe_require_owner(s->engine);
+    int previous=s->n_tokens;
+    if(report)memset(report,0,sizeof *report);
+    for(int i=0;i<in->count;i++)if(in->tokens[i]<0||in->tokens[i]>=XE_VOCAB)return 0;
+    for(size_t i=0;i<in->visual_count;i++)
+        for(int j=0;j<in->visual[i].rows;j++)
+            if(in->tokens[in->visual[i].start+j]!=xe_token_id(s->engine,"<|image|>"))return 0;
+    if(!in->visual_count) {
+        int restarted=s->visual_context!=NULL;
+        if(restarted)xe_session_reset(s);
+        xe_tokens prefix={(int32_t *)in->tokens,in->count,in->count};
+        xe_session_sync_report_impl(s,&prefix,report);
+        if(report&&restarted)report->restarted=1;
+        return 1;
+    }
+    if(s->visual_context && s->n_tokens>=s->visual_prompt_end && in->count>=s->visual_prompt_end &&
+       in->visual_count==s->visual_context->owned.input.visual_count &&
+       xe_session_common_input_validated(s,in)==s->n_tokens) {
+        /* The old owned rows are finite. Equal byte content proves the new
+         * rows are unchanged, without rehashing all pixels on every token. */
+        xe_tokens prefix={(int32_t *)in->tokens,in->count,in->count};
+        xe_session_sync_report_impl(s,&prefix,report);return 1;
+    }
+    int append=xe_session_common_input_validated(s,in)==s->n_tokens && in->count>s->n_tokens;
+    xe_visual_context *next=xe_visual_context_new(in);
+    if(!next)return 0;
+    int capacity=s->text_prefill_rows;
+    for(size_t i=0;i<in->visual_count;i++)if(in->visual[i].rows>capacity)capacity=in->visual[i].rows;
+    if(!xe_session_prefill_reserve(s,capacity)){xe_visual_context_release(next);return 0;}
+    /* Use owned input: in may alias the previous session's token/media data. */
+    in=&next->owned.input;
+    if(append) {
+        xe_visual_context_release(s->visual_context);s->visual_context=NULL;
+        s->visual_prompt_end=0;s->anchor_valid=0;
+    } else xe_session_reset(s);
+    int initial=s->n_tokens;
+    size_t visual=0;
+    while(visual<in->visual_count&&in->visual[visual].start+in->visual[visual].rows<=initial)visual++;
+    while(s->n_tokens<in->count) {
+        int start=s->n_tokens,n=in->count-start;
+        const float *embedding=NULL;
+        if(visual<in->visual_count&&in->visual[visual].start==start) {
+            n=in->visual[visual].rows;embedding=in->visual[visual].embeddings;visual++;
+        } else {
+            if(visual<in->visual_count&&n>in->visual[visual].start-start)n=in->visual[visual].start-start;
+            if(n>s->text_prefill_rows)n=s->text_prefill_rows;
+        }
+        xe_attention_mode mode=embedding?XE_ATTENTION_VISUAL:XE_ATTENTION_CAUSAL;
+        xe_prefill_batch_append_input(s,in->tokens+start,n,start,embedding,mode);
+        xe_gpu_wait(s->engine);xe_prefill_batch_complete(s,start+n==in->count);
+    }
+    xe_session_swa_mirror(s,initial,s->n_tokens);
+    s->visual_context=next;s->visual_prompt_end=in->count;xe_input_hash(in,s->visual_prompt_hash);
+    if(report){report->reused=initial;report->prefilled=in->count-initial;report->restarted=!append&&previous>0;}
+    return 1;
+}
+
+int xe_session_sync_input(xe_session *s,const xe_input *in) {
+    return xe_session_sync_input_report(s,in,NULL);
+}
+
+int xe_session_sync_continuation(xe_session *s,const xe_tokens *prefix,xe_sync_report *report) {
+    if(!s||s->cow||s->prefill_pending||!xe_tokens_valid(prefix)||prefix->len<1||prefix->len<s->n_tokens||
+       prefix->len>s->engine->context)return 0;
+    if(s->visual_context && s->n_tokens<s->visual_prompt_end)return 0;
+    if(memcmp(s->tokens,prefix->v,(size_t)s->n_tokens*4))return 0;
+    xe_session_sync_report_impl(s,prefix,report);return 1;
+}
+
+static int xe_session_rewind_input(xe_session *s,int position) {
+    xe_input in=s->visual_context->owned.input;in.tokens=s->tokens;in.count=s->n_tokens;
+    if(!xe_input_boundary(&in,position))return 0;
+    in.count=position;in.visual_count=0;
+    while(in.visual_count<s->visual_context->owned.input.visual_count &&
+          in.visual[in.visual_count].start+in.visual[in.visual_count].rows<=position)in.visual_count++;
+    return xe_session_sync_input(s,&in);
 }
 
 int xe_session_shadow_start(xe_session *s, const xe_tokens *prefix,
@@ -6682,6 +6923,20 @@ xe_snapshot_status xe_session_snapshot_load(xe_session *s, FILE *in,
     return xe_session_snapshot_load_impl(s,in,expected,NULL);
 }
 
+xe_snapshot_status xe_session_snapshot_load_input(xe_session *s,FILE *file,const xe_input *in) {
+    if(!s||!xe_input_valid(in,s->engine->context)||s->cow||s->prefill_pending)
+        return XE_SNAPSHOT_INVALID_ARGUMENT;
+    xe_visual_context *next=in->visual_count?xe_visual_context_new(in):NULL;
+    if(in->visual_count&&!next)return XE_SNAPSHOT_NOMEM;
+    if(next)in=&next->owned.input;
+    xe_tokens expected={(int32_t *)in->tokens,in->count,in->count};
+    xe_snapshot_status status=xe_session_snapshot_load_impl(s,file,&expected,in);
+    if(status!=XE_SNAPSHOT_OK){xe_visual_context_release(next);return status;}
+    s->visual_context=next;
+    if(next){s->visual_prompt_end=in->count;xe_input_hash(in,s->visual_prompt_hash);}
+    return XE_SNAPSHOT_OK;
+}
+
 const char *xe_snapshot_status_name(xe_snapshot_status status) {
     static const char *names[] = {
         "ok", "invalid-argument", "empty", "io", "format", "version",
@@ -7351,5 +7606,3 @@ void xe_oracle(xe_engine *e, const int32_t *tokens, int n_tokens, const char *du
 
     ref_state_free(&s);
 }
-
-#include "vision_gpu.inc"

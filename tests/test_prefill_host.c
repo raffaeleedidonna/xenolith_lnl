@@ -331,8 +331,8 @@ int main(void) {
     attention_case(&e, XE_ATTENTION_CAUSAL, 512, &global_kernel);
     assert(creates == 1 && group_sizes == 1);
     assert(e.gpu.prefill_attn_online_b8_swa_visual == (ze_kernel_handle_t)&visual_kernel);
-    for (size_t i = 0; i < sizeof e.gpu.vision / sizeof *e.gpu.vision; i++)
-        assert(!e.gpu.vision[i]);
+    for (size_t i = 0; i < sizeof e.gpu.vision.kernels / sizeof *e.gpu.vision.kernels; i++)
+        assert(!e.gpu.vision.kernels[i]);
     puts("Prefill attention dispatch: PASS");
     layout_case(511, 222227840);
     layout_case(512, 222645824);

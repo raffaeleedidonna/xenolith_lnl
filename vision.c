@@ -1,5 +1,5 @@
 #define _POSIX_C_SOURCE 200809L
-#include "vision.h"
+#include "vision_internal.h"
 #include "format.h"
 
 #include <fcntl.h>

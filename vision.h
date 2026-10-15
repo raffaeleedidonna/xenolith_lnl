@@ -42,21 +42,6 @@ typedef struct {
     void *storage;
 } xe_owned_input;
 
-typedef struct {
-    char name[128];
-    uint64_t ne[4], offset, bytes;
-    uint32_t dimensions, type;
-    const void *data;
-} xe_vision_tensor;
-
-typedef struct {
-    void *mapping;
-    size_t mapping_size, data_offset;
-    xe_vision_tensor *tensors;
-    size_t tensor_count;
-    uint8_t sha256[32];
-} xe_vision_model;
-
 /* Reference status is diagnostic, not a compatibility or cache allowlist. */
 int xe_vision_weights_reference(const uint8_t id[32], int projector);
 
@@ -81,10 +66,5 @@ int xe_input_load(FILE *file, int context, xe_owned_input *out);
 void xe_visual_identity(const xe_image *image, const uint8_t model_hash[32],
                          const uint8_t projector_hash[32], const float *embeddings,
                          const char *numeric_revision, uint8_t out[32]);
-int xe_vision_model_open(xe_vision_model *out, const char *path,
-                         char *error, size_t error_cap);
-void xe_vision_model_close(xe_vision_model *model);
-const xe_vision_tensor *xe_vision_tensor_get(const xe_vision_model *model,
-                                            const char *name);
 
 #endif
