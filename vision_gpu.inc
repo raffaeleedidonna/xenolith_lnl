@@ -185,6 +185,8 @@ int xe_engine_encode_image(xe_engine *e,const xe_image *im,float *output,const c
 static int xe_session_prefill_reserve(xe_session *s,int rows) {
     if(rows<=s->prefill_capacity)return 1;
     if(rows>XE_VISUAL_MAX||s->cow||s->prefill_pending)return 0;
+    /* A live shadow borrows this workspace and owns both spare SWA slabs. */
+    if(!s->swa_spare_k||!s->swa_spare_v)return 0;
     xe_prefill_workspace w;
     size_t bytes=xe_prefill_workspace_layout_rows(&w,NULL,rows);
     void *next=xe_alloc(s->engine,bytes,XE_MEM_SHARED);
