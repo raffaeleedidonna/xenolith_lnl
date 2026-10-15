@@ -36,9 +36,26 @@ int main(int argc,char **argv) {
     ids[count]=9264;input.count=count+1;CHECK(xe_session_sync_input(s,&input));
     CHECK(xe_session_anchor_capture(s));
     xe_session *shadow=xe_session_shadow_new(s);CHECK(shadow);CHECK(shadow->visual_context==s->visual_context);
+    void *borrowed_workspace=s->prefill_workspace;
+    int borrowed_capacity=s->prefill_capacity;
+    size_t borrowed_bytes=s->prefill_workspace_size;
+    CHECK(shadow->prefill_workspace==borrowed_workspace);
+    CHECK(shadow->prefill_capacity==borrowed_capacity&&shadow->prefill_workspace_size==borrowed_bytes);
+    if(borrowed_capacity<XE_VISUAL_MAX) {
+        CHECK(!xe_session_prefill_reserve(s,XE_VISUAL_MAX));
+        CHECK(s->prefill_workspace==borrowed_workspace&&s->prefill_capacity==borrowed_capacity);
+        CHECK(s->prefill_workspace_size==borrowed_bytes);
+        CHECK(shadow->prefill_workspace==borrowed_workspace&&shadow->prefill_capacity==borrowed_capacity);
+        CHECK(shadow->prefill_workspace_size==borrowed_bytes);
+    }
     ids[count+1]=106;xe_tokens tail={ids,count+2,8192};CHECK(xe_session_shadow_sync(shadow,&tail)>=0);
     xe_session_shadow_refresh_logits(shadow);float *shadow_logits=malloc(XE_VOCAB*4);CHECK(shadow_logits);
     memcpy(shadow_logits,shadow->logits,XE_VOCAB*4);CHECK(xe_session_shadow_promote(s,shadow));xe_session_free(shadow);
+    /* Promotion/free returns the SWA spares and ends the workspace borrow. */
+    CHECK(xe_session_prefill_reserve(s,XE_VISUAL_MAX));
+    CHECK(s->prefill_workspace&&s->prefill_capacity==XE_VISUAL_MAX);
+    xe_prefill_workspace grown;
+    CHECK(s->prefill_workspace_size==xe_prefill_workspace_layout_rows(&grown,NULL,XE_VISUAL_MAX));
     CHECK(s->n_tokens==count+2);CHECK(!memcmp(shadow_logits,s->logits,XE_VOCAB*4));
     /* Rewind/replay at an image boundary; memory belongs to the session. */
     xe_session_rewind(s,count);CHECK(s->n_tokens==count);
