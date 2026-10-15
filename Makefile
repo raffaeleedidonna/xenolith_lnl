@@ -33,7 +33,7 @@ clean:
 		tests/test_prefill_projection tests/test_prefill_qkv tests/test_prefill_swa \
 		tests/test_prefill_dense tests/test_prefill_layer tests/test_prefill_session \
 		tests/test_prefill_session_drop tests/test_prefill_session_safe \
-		tests/test_session_sync tests/test_format tests/test_snapshot \
+		tests/test_session_sync tests/test_format tests/test_sha256 tests/test_snapshot \
 		tests/test_snapshot_model \
 		tests/test_kvstore tests/test_conversation \
 		tests/test_conversation_model \
@@ -63,7 +63,7 @@ LLAMA_LDLIBS=-lllama -lggml -lggml-base
 
 TEST_CFLAGS=-O2 -std=c11 -Wall -Wextra -pthread
 
-UNIT_TESTS=tests/test_inference tests/test_format tests/test_json tests/test_decode tests/test_conversation tests/test_gpu_alloc tests/test_context_limits
+UNIT_TESTS=tests/test_inference tests/test_format tests/test_sha256 tests/test_json tests/test_decode tests/test_conversation tests/test_gpu_alloc tests/test_context_limits
 GPU_TESTS=tests/test_kv tests/test_snapshot tests/test_kvstore tests/test_prefill_session
 PERSISTENCE_TESTS=tests/test_cache_model tests/test_snapshot_model tests/test_conversation_model tests/test_session_sync
 PREFILL_TESTS=tests/test_prefill_projection tests/test_prefill_qkv tests/test_prefill_swa \
@@ -104,6 +104,10 @@ check-context: tests/test_cli_context
 
 tests/test_format: tests/test_format.c format.o format.h
 	$(CC) $(TEST_CFLAGS) -I. -o $@ tests/test_format.c format.o -pthread
+
+# Compile without -march=native to exercise runtime SHA dispatch in host builds.
+tests/test_sha256: tests/test_sha256.c format.c format.h
+	$(CC) $(TEST_CFLAGS) -I. -o $@ $<
 
 tests/test_json: tests/test_json.c json.o json.h
 	$(CC) $(TEST_CFLAGS) -I. -o $@ tests/test_json.c json.o -pthread -lm
