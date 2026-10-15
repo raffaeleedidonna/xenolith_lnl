@@ -233,8 +233,6 @@ struct xe_engine {
     int map_fd;
     const void *data;
     size_t tensor_directory_pos;
-    uint8_t model_file_identity[32];
-    int model_content_verified;
     size_t header_len;   /* bytes before the tensor data section: metadata + tensor directory */
     uint32_t gguf_version;
     char *name;
@@ -3324,7 +3322,6 @@ static xe_engine *xe_map_file(const char *gguf_path) {
     e->map = map;
     e->map_len = (size_t)st.st_size;
     e->map_fd = fd;
-    format_weights_file_identity(&st, e->model_file_identity);
     e->bos_id = e->eos_id = e->eot_id = e->unk_id = e->pad_id = -1;
 
     return e;
@@ -3921,7 +3918,18 @@ static xe_engine *xe_open_common(const char *gguf_path, int vocab_only, xe_cur *
 
 static void xe_snapshot_fingerprints_init(xe_engine *e);
 
-xe_engine *xe_engine_open_with_context(const char *gguf_path, int context) {
+const uint8_t *xe_engine_model_fingerprint(xe_engine *e) {
+    if (!e) return NULL;
+    if (e->pool_initialized) xe_require_owner(e);
+    if (!e->model_content_hash_ready) {
+        format_sha256_bytes(e->map, e->map_len, e->model_content_hash);
+        e->model_content_hash_ready = 1;
+    }
+    return e->model_content_hash;
+}
+
+static xe_engine *xe_engine_open_impl(const char *gguf_path, int context,
+                                      int prepare_cache) {
     if (context < XE_CONTEXT_MIN || context > XE_CONTEXT_MAX)
         xe_fatal("context: capacity %d out of range [%d, %d]",
                  context, XE_CONTEXT_MIN, XE_CONTEXT_MAX);
@@ -3930,11 +3938,31 @@ xe_engine *xe_engine_open_with_context(const char *gguf_path, int context) {
     e->context = context;
     xe_bind_tensors(e, &c, gguf_path);
     xe_check_complete(e, gguf_path);
+    if (prepare_cache) {
+        /* Identify the original GGUF before repacking or dropping source pages.
+         * This is cache identity, not an allowlist of supported weight values. */
+        struct timespec hash_start, hash_end;
+        fprintf(stderr, "xenolith: computing full model SHA-256...\n");
+        clock_gettime(CLOCK_MONOTONIC, &hash_start);
+        xe_engine_model_fingerprint(e);
+        clock_gettime(CLOCK_MONOTONIC, &hash_end);
+        fprintf(stderr, "xenolith: model SHA-256 ready (%.2f s)\n",
+                (double)(hash_end.tv_sec - hash_start.tv_sec) +
+                (double)(hash_end.tv_nsec - hash_start.tv_nsec) / 1e9);
+    }
     xe_constants_init(e);
     xe_gpu_init(e);
     xe_repack(e, gguf_path);
-    xe_snapshot_fingerprints_init(e);
+    if (prepare_cache) xe_snapshot_fingerprints_init(e);
     return e;
+}
+
+xe_engine *xe_engine_open_with_context(const char *gguf_path, int context) {
+    return xe_engine_open_impl(gguf_path, context, 0);
+}
+
+xe_engine *xe_engine_open_cached(const char *gguf_path, int context) {
+    return xe_engine_open_impl(gguf_path, context, 1);
 }
 
 xe_engine *xe_engine_open(const char *gguf_path) {
@@ -5849,19 +5877,12 @@ static void xe_snapshot_fingerprints_init(xe_engine *e) {
     if (e->snapshot_fingerprint_ready) return;
     format_sha256 hash;
 
-    /* MODEL covers the GGUF header (every metadata key plus the full
-     * tensor directory: names, shapes, types, offsets) and the file size,
-     * never the tensor bytes. The v1 fingerprint hashed the whole 14 GB
-     * file, lazily, on the first checkpoint or resume (55 s). Same-shape
-     * requants and fine-tunes with identical metadata are deliberately
-     * not detected; see NOTES "3.7 finding 1". */
-    format_sha256_init(&hash);
-    format_sha256_update(&hash, "xenolith-model-v2",
-                         sizeof("xenolith-model-v2") - 1);
-    xe_snapshot_hash_u64(&hash, e->map_len);
-    xe_snapshot_hash_u64(&hash, e->header_len);
-    if (e->header_len) format_sha256_update(&hash, e->map, e->header_len);
-    format_sha256_final(&hash, e->snapshot_fingerprint[XE_SNAPSHOT_FP_MODEL]);
+    /* Raw SHA-256 of all GGUF bytes, computed once per engine. Older
+     * header-only MODEL identities intentionally fail as model-mismatch:
+     * their tensor contents cannot be established retroactively. The wire
+     * layout and numerical ABI are unchanged. */
+    memcpy(e->snapshot_fingerprint[XE_SNAPSHOT_FP_MODEL],
+           xe_engine_model_fingerprint(e), 32);
 
     format_sha256_init(&hash);
     format_sha256_update(&hash, "xenolith-tokenizer-v1",

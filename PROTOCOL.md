@@ -32,10 +32,35 @@ falling back to `~/.local/state/xenolith` and `~/.cache/xenolith/kv`.
 
 Without `--mmproj`, the service exposes the existing text-only protocol 1.
 With `--mmproj /path/to/mmproj-F16.gguf`, it exposes protocol 2 with images,
-using the locked artifacts in [vision/manifest.json](vision/manifest.json).
+with the reference artifacts documented in [vision/manifest.json](vision/manifest.json).
 Vision defaults to context 65536 and accepts only `--ctx 65536|131072`.
 Clients must inspect `describe.protocol` and `describe.vision` before sending
 images. A protocol 1 service rejects image requests and visual conversations.
+
+`--cache-budget` also determines model fingerprint preparation. With a positive
+budget (including the default), `serve` and `wire` compute the full GGUF SHA-256
+once during startup, before repacking releases source pages. All snapshot
+fingerprints are ready before the socket accepts clients or stdin requests are
+processed. Startup diagnostics go to stderr; fingerprint computation does not
+occur during prefill, decode or finalization.
+
+For text-only services, `--cache-budget 0` skips model fingerprint computation
+as well as disk KV cache reads and writes. Durable conversation history and in-memory KV
+reuse still work. The standalone `chat`, `run`, `info`, `oracle` and `bench`
+commands also skip model fingerprint computation when used without images.
+
+This is a service-wide startup decision, not a per-request choice. An
+`ephemeral` request sent to a cache-enabled service still uses an engine whose
+fingerprints were prepared at startup. For a text-only, ephemeral-only service that
+avoids this work, start it with `--cache-budget 0`. A positive budget prepares
+the fingerprints even if opening the cache directory later fails.
+
+With `--mmproj`, vision also needs full model and projector identities for
+image records and derived embeddings, independently of disk KV caching. These
+hashes and the visual numerical identity are prepared during startup even with
+`--cache-budget 0`; that option still disables both disk caches. Model hashing
+occurs before repacking and is reused when vision is enabled. CLI image commands
+likewise prepare identities before encoding the image.
 
 Each frame is one JSON object followed by a newline. Escape newlines inside
 strings; do not pretty-print a frame across lines. There are no request IDs or
@@ -404,10 +429,17 @@ point is missing or rejected, restoration tries earlier compatible points in
 the current cache epoch before rebuilding. Resuming an earlier point requires
 prefill for the remaining transcript.
 
-Text snapshots use upstream format v2 and its stable numerical ABI. The audited
-v1 bridge for `68b8fbf55` requires the same compiled kernel and numerical settings;
-this vision build's changed kernel does not qualify, so those snapshots replay
-their transcript. Other v1 producers remain unsupported.
+Checkpoint model identity is the SHA-256 of the complete GGUF, including tensor
+values. A compatible fine-tune can be loaded, but cannot reuse another model's
+computed state. A mismatch reports `model_mismatch` and falls back to prefill
+from the retained transcript. Moving or copying identical model bytes does not
+invalidate this identity.
+
+Older checkpoints with header-only model identities, including v1 from
+`68b8fbf55` and earlier v2 writers, are rejected as `model_mismatch` and rebuilt.
+Their original tensor contents cannot be verified retroactively. The text
+checkpoint layout remains v2 and its numerical ABI is unchanged; current writers continue
+to support reuse across builds with compatible numerical settings.
 
 Visual snapshots use format v3 with a mixed-input identity and numerical ABI.
 The earlier visual-v2 format is recognized separately from text-v2 and falls
@@ -504,8 +536,16 @@ The external protocol is implemented in [serve.c](serve.c); [runtime.h](runtime.
 defines the C orchestration API behind it. The `wire` CLI command and socket
 name remain unchanged by the internal rename to `runtime`.
 
-With OpenSSL unavailable or failed, the engine warns and performs metadata-only
-weight checks rather than a generic full-file SHA-256 scan. Visual numerical
-identity binds this policy and file identity (including mtime/ctime) separately
-from full-content verification. Existing image media can be replayed across
-policy changes; embeddings and KV snapshots cannot cross-reuse computations.
+Vision uses the same in-tree full SHA-256 implementation as text checkpoints,
+with Intel SHA instructions when available and a portable C fallback. It has no
+OpenSSL dependency or metadata-only verification mode. Model and projector
+structure must match the supported architecture, tensor shapes and types.
+Reference hashes identify the tested artifacts; different compatible weights
+load with a diagnostic and distinct cache identities. Structural compatibility
+does not certify the quality of a fine-tune or its pairing with a projector.
+
+Persisted source images survive weight changes. The runtime derives embeddings
+and KV under the current identities; it never reuses computations from different
+weights. Original media integrity and preprocessing checks still apply. Older
+metadata-based visual records can supply media for replay, but their identities
+cannot establish compatible computed state.

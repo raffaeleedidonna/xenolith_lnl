@@ -44,6 +44,7 @@
 /tests/test_decode
 /tests/test_fixture_decode
 /tests/test_format
+/tests/test_sha256
 /tests/test_gpu_alloc
 /tests/test_json
 /tests/test_kv
@@ -90,8 +91,9 @@ tests/test_vision_session
 
 /tests/test_text_batch_model
 
-/tests/test_sha256_fast
 /tests/test_weights_identity
 /tests/test_cache_policy
 /tests/test_cache_model
 /tests/test_visual_cache
+
+/tests/test_visual_replay

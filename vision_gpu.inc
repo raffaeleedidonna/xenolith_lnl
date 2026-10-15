@@ -31,11 +31,20 @@ int xe_engine_enable_vision(xe_engine *e,const char *path,char *error,size_t cap
     if(!e||e->vision_weights){if(error&&cap)snprintf(error,cap,"vision already open or engine missing");return 0;}
     xe_worker_pool_init(e);
     xe_require_owner(e);
-    const uint8_t *model_id = xe_engine_model_fingerprint(e);
-    if(!xe_vision_weights_fingerprint_matches(model_id, 0, e->model_content_verified)) {
-        if(error&&cap)snprintf(error,cap,"vision model checksum or metadata mismatch; see vision/manifest.json");
-        return 0;
+    /* Vocab-only CLI encoders have parsed metadata, but not tensor shapes. */
+    if (e->vocab_only && !e->header_len) {
+        if (format_get_u64le((const uint8_t *)e->map + 8) != XE_TENSOR_COUNT) {
+            if (error && cap) snprintf(error, cap, "vision language model tensor count mismatch");
+            return 0;
+        }
+        xe_cur c = {(const uint8_t *)e->map, e->map_len, e->tensor_directory_pos};
+        xe_bind_tensors(e, &c, "vision language model");
+        xe_check_complete(e, "vision language model");
     }
+    const uint8_t *model_id = xe_engine_model_fingerprint(e);
+    if (!xe_vision_weights_reference(model_id, 0))
+        fprintf(stderr, "xenolith: vision language model differs from the reference weights; "
+                        "using its full content identity for cache isolation.\n");
     xe_vision_model model;
     if(!xe_vision_model_open(&model,path,error,cap))return 0;
     if(!e->gpu.context)xe_gpu_init(e);
@@ -45,6 +54,14 @@ int xe_engine_enable_vision(xe_engine *e,const char *path,char *error,size_t cap
     for(size_t i=0;i<model.tensor_count;i++)model.tensors[i].data=(const uint8_t *)e->vision_weights+model.tensors[i].offset;
     munmap(model.mapping,model.mapping_size);model.mapping=NULL;
     e->vision_model=model;
+    /* Prepare this during startup too, before the first image request. */
+    uint8_t numeric[32];
+    if (!xe_engine_vision_numeric_fingerprint(e, numeric)) {
+        xe_free(e, e->vision_weights, XE_MEM_SHARED);e->vision_weights=NULL;
+        xe_vision_model_close(&e->vision_model);
+        if (error && cap) snprintf(error, cap, "cannot prepare vision numerical identity");
+        return 0;
+    }
     return 1;
 }
 
@@ -176,38 +193,6 @@ static int xe_session_prefill_reserve(xe_session *s,int rows) {
     return 1;
 }
 
-const uint8_t *xe_engine_model_fingerprint(xe_engine *e) {
-    if(!e || !e->map || !e->map_len)return NULL;
-    xe_worker_pool_init(e);xe_require_owner(e);
-    if(!e->model_content_hash_ready) {
-        format_sha256_backend backend = format_sha256_bytes_fast(e->map,e->map_len,e->model_content_hash);
-        e->model_content_verified = backend == FORMAT_SHA256_OPENSSL;
-        if (!e->model_content_verified) {
-            format_weights_verification_warning(backend, "language model");
-            if (!e->header_len) {
-                /* Vocab-only opening has not visited the tensor directory. */
-                xe_cur c = {(const uint8_t *)e->map, e->map_len, 8};
-                uint64_t tensors = xe_u64(&c);
-                if (tensors > e->map_len / 24) xe_fatal("invalid GGUF tensor count");
-                c.pos = e->tensor_directory_pos;
-                for (uint64_t i = 0; i < tensors; i++) {
-                    (void)xe_read_str(&c);
-                    uint32_t dimensions = xe_u32(&c);
-                    if (dimensions < 1 || dimensions > 4) xe_fatal("invalid GGUF tensor dimensions");
-                    for (uint32_t j = 0; j < dimensions; j++) (void)xe_u64(&c);
-                    (void)xe_u32(&c); (void)xe_u64(&c);
-                }
-                uint64_t end = xe_align_up(c.pos, e->alignment);
-                if (end > e->map_len) xe_fatal("GGUF tensor directory exceeds file bounds");
-                e->header_len = (size_t)end;
-            }
-            format_weights_metadata_hash(e->map, e->header_len, e->map_len, e->model_content_hash);
-        }
-        e->model_content_hash_ready=1;
-    }
-    return e->model_content_hash;
-}
-
 const uint8_t *xe_engine_vision_fingerprint(const xe_engine *e) {
     return e && e->vision_weights ? e->vision_model.sha256 : NULL;
 }
@@ -215,12 +200,9 @@ const uint8_t *xe_engine_vision_fingerprint(const xe_engine *e) {
 int xe_engine_vision_artifacts_match(const xe_engine *e, const uint8_t model[32],
                                     const uint8_t projector[32]) {
     if (!e || !e->vision_weights || !e->model_content_hash_ready) return 0;
-    /* Persisted media can cross verification modes. Computed rows/KV cannot:
-     * their numeric fingerprint binds mode and, for metadata, file identity. */
-    return (xe_vision_weights_fingerprint_matches(model, 0, 0) ||
-            xe_vision_weights_fingerprint_matches(model, 0, 1)) &&
-           (xe_vision_weights_fingerprint_matches(projector, 1, 0) ||
-            xe_vision_weights_fingerprint_matches(projector, 1, 1));
+    return model && projector &&
+           !memcmp(model, e->model_content_hash, 32) &&
+           !memcmp(projector, e->vision_model.sha256, 32);
 }
 
 int xe_engine_vision_numeric_fingerprint(xe_engine *e,uint8_t out[32]) {
@@ -236,12 +218,8 @@ int xe_engine_vision_numeric_fingerprint(xe_engine *e,uint8_t out[32]) {
     uint8_t *native=malloc(native_size);if(!native)return 0;
     if(zeModuleGetNativeBinary(e->gpu.module,&native_size,native)!=ZE_RESULT_SUCCESS){free(native);return 0;}
     format_sha256 hash;format_sha256_init(&hash);
-    const char *domain="xenolith-visual-numeric-v3";
+    const char *domain="xenolith-visual-numeric-v4";
     format_sha256_update(&hash,domain,strlen(domain));
-    uint8_t verification[2] = {e->model_content_verified, e->vision_model.content_verified};
-    format_sha256_update(&hash, verification, sizeof verification);
-    if (!e->model_content_verified) format_sha256_update(&hash, e->model_file_identity, 32);
-    if (!e->vision_model.content_verified) format_sha256_update(&hash, e->vision_model.file_identity, 32);
     format_sha256_update(&hash,XE_VISION_NUMERIC_REVISION,strlen(XE_VISION_NUMERIC_REVISION));
     format_sha256_update(&hash,XE_NUMERIC_SOURCE_HASH,strlen(XE_NUMERIC_SOURCE_HASH));
     format_sha256_update(&hash,XE_NUMERIC_CFLAGS_HASH,strlen(XE_NUMERIC_CFLAGS_HASH));

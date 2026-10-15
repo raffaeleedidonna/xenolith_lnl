@@ -250,7 +250,12 @@ sono raccolti nel [report](results/chat-kitten.json). Due turni sul JPEG reale
 del gattino e due turni testuali passano; i 143 controlli dei parametri passano.
 Il log conferma una sola esecuzione dell’encoder per la conversazione visuale.
 
-## Verifica pesi accelerata e fallback rapido
+## Verifica pesi accelerata e fallback rapido (storico)
+
+Questa sezione descrive la campagna del precedente loader OpenSSL. Il loader
+corrente riusa lo SHA completo di `main`, senza OpenSSL né fallback ai soli
+metadati. I risultati sottostanti restano evidenza storica, non descrivono la
+policy corrente; vedere [INPUT_FORMAT.md](INPUT_FORMAT.md).
 
 L’aggiornamento successivo al commit `a7f7e68` usa l’API `EVP_Q_digest` della
 libreria OpenSSL 3 già disponibile su Linux, caricata opzionalmente senza
@@ -445,3 +450,39 @@ Per il confronto ABBA conclusivo:
 python3 tools/vision_bench.py --model "$MODEL" --baseline /path/to/baseline/xenolith \
   --candidate ./xenolith --paired --repetitions 3 --output vision-runs/paired
 ```
+
+## Integrazione locale dell'identità completa da main
+
+L'integrazione di `88e8661` sul branch vision `28c544e` riusa lo SHA di
+`format.c`, elimina il loader OpenSSL e distingue compatibilità strutturale,
+identità dei contenuti e artefatti di riferimento. Il proiettore ora controlla
+i metadati numerici richiesti e tutti i 356 tensori, inclusi tipi, dimensioni,
+limiti e sovrapposizioni. Gli hash del manifest restano riferimenti diagnostici.
+
+Le verifiche mirate sull'i7-13700H comprendono:
+
+- Loader reale su tre GGUF sintetici compatibili con contenuti/header diversi,
+  SHA completo confrontato con `hashlib`, e rifiuto di 26 strutture non valide;
+  gli stessi casi passano con UBSan.
+- Replay dei media persistiti, cambio di modello/proiettore, isolamento e riuso
+  della cache, e rifiuto di media o identità derivate incoerenti. Il test host
+  passa anche con ASan/UBSan (rilevamento dei leak disabilitato).
+- Modello e proiettore reali del manifest: modifica dei contenuti rilevata dal
+  digest, variante strutturalmente compatibile accettata, header errato rifiutato.
+- Test GPU vision; per un PNG rosso e budget 70, i 64 embedding risultanti
+  (720.896 byte F32) sono identici byte per byte tra la PR originale e questa
+  integrazione. È una verifica di regressione, non una nuova campagna di qualità.
+- Checkpoint testuali v2 fra build correnti e migrazione dei writer storici v1/v2
+  con identità dei soli metadati: rifiuto senza alterare lo stato, ricostruzione
+  a 64/1057 token e continuazione esatta su decode CPU ed estensione GPU.
+- Servizio reale a contesto 65536: avvio vision con cache zero, riapertura di una
+  conversazione della PR originale, cambio del proiettore e successivo riavvio.
+  I media restano disponibili, la vecchia KV non viene caricata, e il riavvio
+  con gli stessi pesi carica il checkpoint a 144 token. Tutte le risposte
+  identificano il rosso; ogni avvio corrente calcola il digest del modello una
+  sola volta, prima delle richieste.
+
+La policy corrente e l'eccezione di startup per `--mmproj` sono documentate in
+[PROTOCOL.md](../PROTOCOL.md) e [INPUT_FORMAT.md](INPUT_FORMAT.md). I report
+storici OpenSSL e i precedenti risultati numerici restano riferiti ai rispettivi
+commit, senza attribuirli al codice modificato.

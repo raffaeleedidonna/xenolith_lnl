@@ -152,11 +152,16 @@ static void runtime_visual_prune(runtime *w) {
 static runtime_status runtime_visual_asset_get(runtime *w,const xe_image *meta,
                                   const uint8_t *media,size_t size,const uint8_t *record,
                                   runtime_visual_asset **out) {
+    /* Original media remain valid across weight changes; only compare derived
+     * rows with the old record when both weights and numerical identity match. */
+    int same_computation = record &&
+        xe_engine_vision_artifacts_match(w->engine, record+176, record+144) &&
+        !memcmp(record+208, w->vision_numeric, 32);
     uint8_t key[32];runtime_visual_key(w,meta,key);
     for(size_t i=0;i<w->vision_asset_count;i++) {
         runtime_visual_asset *a=w->vision_assets[i];
         if(!memcmp(a->key,key,32)&&a->media_size==size&&!memcmp(a->media,media,size)) {
-            if(record&&!memcmp(record+208,w->vision_numeric,32)&&memcmp(record+112,a->identity,32))
+            if(same_computation&&memcmp(record+112,a->identity,32))
                 return runtime_fail(w,RUNTIME_INVALID_ARGUMENT,"image numerical replay mismatch");
             a->epoch=w->vision_epoch;*out=a;return RUNTIME_OK;
         }
@@ -188,7 +193,7 @@ static runtime_status runtime_visual_asset_get(runtime *w,const xe_image *meta,
                            a->embeddings,XE_VISION_NUMERIC_REVISION,a->identity);
         runtime_visual_cache_write(w,meta,a);
     }
-    if(record&&!memcmp(record+208,w->vision_numeric,32)&&memcmp(record+112,a->identity,32)) {
+    if(same_computation&&memcmp(record+112,a->identity,32)) {
         runtime_visual_asset_free(a);return runtime_fail(w,RUNTIME_INVALID_ARGUMENT,"image numerical replay mismatch");
     }
     if(w->vision_asset_count==w->vision_asset_capacity) {
@@ -233,8 +238,6 @@ static runtime_status runtime_visual_collect(runtime *w,conversation *c) {
                boundary<previous||(uint64_t)offset+meta.rows>boundary-previous)
                 return runtime_fail(w,RUNTIME_INVALID_ARGUMENT,"invalid image layout");
             const uint8_t *p=block->data;
-            if(!xe_engine_vision_artifacts_match(w->engine, p+176, p+144))
-                return runtime_fail(w,RUNTIME_INVALID_ARGUMENT,"image model mismatch; rebuild required");
             runtime_visual_asset *asset;runtime_status status=runtime_visual_asset_get(w,&meta,media,size,p,&asset);
             if(status!=RUNTIME_OK)return status;
             status=runtime_visual_push(w,asset,(int)previous+offset);if(status!=RUNTIME_OK)return status;

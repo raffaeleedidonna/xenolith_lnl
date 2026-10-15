@@ -54,13 +54,23 @@ enum {
 xe_engine *xe_engine_open_with_context(const char *gguf_path, int context);
 xe_engine *xe_engine_open(const char *gguf_path);
 xe_engine *xe_engine_open_vocab(const char *gguf_path);
+/* Prepare snapshot fingerprints during opening, with the full model hash
+ * computed before repack releases source pages. Used by wire/serve when
+ * --cache-budget > 0 or --mmproj is set, so requests never pay that cost. */
+xe_engine *xe_engine_open_cached(const char *gguf_path, int context);
+/* SHA-256 of the complete original GGUF, owned by the engine until close.
+ * Cached opening computes it eagerly. Other opening functions defer it until
+ * this call or the first snapshot save/load/check. Subsequent calls reuse it.
+ * Call on the engine owner thread. The model file must remain unchanged for
+ * the engine's lifetime.
+ * This identifies cache contents; it does not restrict compatible variants. */
+const uint8_t *xe_engine_model_fingerprint(xe_engine *e);
 void xe_engine_close(xe_engine *e);
 void xe_engine_info(const xe_engine *e, FILE *out);
 int xe_engine_enable_vision(xe_engine *e, const char *mmproj_path,
                              char *error, size_t error_cap);
 int xe_engine_encode_image(xe_engine *e, const xe_image *image, float *output,
                             const char *dump_directory);
-const uint8_t *xe_engine_model_fingerprint(xe_engine *e);
 const uint8_t *xe_engine_vision_fingerprint(const xe_engine *e);
 int xe_engine_vision_artifacts_match(const xe_engine *e,
                                     const uint8_t model_id[32],

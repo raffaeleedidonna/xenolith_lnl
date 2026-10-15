@@ -31,7 +31,7 @@ cache entries. An encoder revision change invalidates the affected cache.
 Persistence stores original encoded media, decoded/preprocessing metadata,
 identities and the ordered span map. Snapshots additionally bind the complete
 computed-input identity and numerical fingerprint. Embedding caches are
-disposable derived data; replay must succeed from retained media and pinned
+disposable derived data; replay must succeed from retained media and compatible
 model artifacts. Missing media is an explicit error, never an empty image.
 
 The CLI uses an immutable visual prompt followed by text-only decode. The C
@@ -52,7 +52,7 @@ requires re-encoding and a new identity.
 Visual KV snapshots use version 3 of `XENXKV`: the six existing KV sections
 are unchanged. Header flag at byte 24 is 1, bytes 320..351 contain the complete
 computed-input hash, bytes 352..355 contain the text numerical ABI, and
-bytes 356..375 are reserved zero. MODEL binds the selected language-model fingerprint. Loading requires
+bytes 356..375 are reserved zero. MODEL binds the full language-model GGUF SHA-256. Loading requires
 `xe_session_snapshot_load_input` and the matching mixed input. Token-only
 load rejects these snapshots. Text snapshots use upstream version 2 with its
 stable numerical ABI and diagnostic fields. The older visual version 2 is
@@ -89,7 +89,8 @@ Their key binds preprocessing identity, both weight hashes and numerical
 fingerprint. Header CRC64, row SHA-256, finite values and computed visual
 identity are checked before reuse. Publication is atomic and the 2 GiB cache
 evicts by last use. Missing or corrupt derived data is re-encoded from media;
-source/weight/preprocessing mismatches fail explicitly. Runtime media limits
+source integrity and preprocessing mismatches fail explicitly. Weight changes
+select distinct derived caches and replay the retained media. Runtime media limits
 are 48 MiB per image and 256 MiB per active context; the low-level C archive
 retains its 64 MiB per-image limit. Source files are never needed after append.
 
@@ -104,17 +105,23 @@ see [PROTOCOL.md](../PROTOCOL.md). Protocol v1 remains text-only. Runtime visual
 replay is synchronous; its asynchronous shadow prefill optimization is disabled
 for visual prompts. Core shadow/COW and promotion still support owned images.
 
-Weight verification defaults to full SHA-256 through the optional OpenSSL 3
-library on Linux. If unavailable or unsuccessful, the loader warns and uses
-the pre-vision MODEL v2 fingerprint (complete header/tensor directory plus file
-size), compared with metadata pins in the manifest. It does not hash all tensor
-bytes using the generic C implementation. Tensor payload changes with unchanged
-metadata can therefore pass this fallback policy. It can be selected explicitly
-with `XENOLITH_WEIGHTS_VERIFY=metadata` for diagnostics.
+Language-model and projector identities are SHA-256 of the entire original
+GGUF, computed with the in-tree implementation from `format.c`. Intel SHA
+instructions accelerate the same digest; the portable C fallback preserves
+identical semantics. OpenSSL and `XENOLITH_WEIGHTS_VERIFY` are no longer used.
 
-The visual numerical fingerprint v3 binds verification mode separately for
-model and projector. In metadata mode it also binds each mapped file's device,
-inode, size, mtime and ctime with nanoseconds; access time is excluded. Metadata
-and full-content caches/snapshots never cross-reuse computations. Persisted image
-records may identify the same pinned artifacts by either known fingerprint,
-so retained media remain usable for re-encoding/replay across policy changes.
+The engine validates architecture, metadata required by the implementation, and
+all tensor types/shapes before enabling vision. Reference hashes in the manifest
+are diagnostic: compatible variants load with a notice, and their full hashes
+isolate embeddings and KV. This does not validate model/projector training
+compatibility or output quality. The weight files must remain unchanged while
+an engine uses them.
+
+Visual numerical identity uses domain `xenolith-visual-numeric-v4`; verification
+mode and file timestamps/inodes are no longer inputs. Old computed state is
+invalidated, while original media can be replayed under the current weights.
+Recorded embedding identity is compared only when both weight identities and
+the numerical identity match. Preprocessing and media integrity remain mandatory.
+For services, vision identities are prepared at startup even with a zero disk
+cache budget; text-only services follow `--cache-budget` as described in
+[PROTOCOL.md](../PROTOCOL.md).

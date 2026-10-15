@@ -427,46 +427,103 @@ void xe_vision_model_close(xe_vision_model *m) {
     free(m->tensors);memset(m,0,sizeof *m);
 }
 
-/* Metadata pins use the pre-vision MODEL v2 fingerprint: header + size.
- * This checks compatibility, not tensor contents. Both pins identify the same
- * supported artifacts; numeric/cache identity separately binds verification. */
-int xe_vision_weights_fingerprint_matches(const uint8_t id[32], int projector,
-                                          int content_verified) {
-    static const uint8_t pins[2][2][32] = {
-        { {0xd9,0x46,0x5e,0x49,0xed,0xd7,0xe2,0xc2,0x00,0x35,0xf9,0xbd,0xc4,0x6f,0x65,0x9b,0x59,0xa5,0xdf,0x0d,0xa9,0xf8,0xc4,0xea,0xd3,0x4a,0xcd,0xe0,0x70,0xfd,0x2e,0x8d}, {0xa7,0xc5,0xbc,0x71,0x5f,0x5f,0xf8,0xe9,0x9a,0x3e,0x89,0x01,0xce,0x7d,0x2b,0x42,0xb4,0x02,0xc6,0x69,0xbf,0x24,0xf7,0xc5,0x25,0x07,0x47,0x63,0x3d,0x0f,0x58,0x91} },
-        { {0x48,0xc9,0x55,0xdf,0x85,0x84,0xa2,0x5e,0x94,0xf0,0xde,0xb0,0x5c,0x93,0x94,0xe3,0xba,0x24,0x78,0x4d,0xb1,0xa3,0x4d,0xbc,0xba,0x51,0xc6,0xfd,0x43,0x54,0x8d,0x30}, {0xd0,0x0f,0x21,0x1a,0x7d,0x4f,0x7f,0xb1,0x9b,0xd9,0xb7,0x5d,0x8e,0x93,0x42,0xec,0xcf,0xfb,0x59,0x20,0xb0,0x8f,0xd9,0x56,0x21,0x67,0x56,0x0f,0xdf,0xcc,0x5d,0xd1} }
+/* The manifest identifies the tested pair. Compatible variants get different
+ * cache identities; matching these hashes is not a loading requirement. */
+int xe_vision_weights_reference(const uint8_t id[32], int projector) {
+    static const uint8_t pins[2][32] = {
+        {0xa7,0xc5,0xbc,0x71,0x5f,0x5f,0xf8,0xe9,0x9a,0x3e,0x89,0x01,0xce,0x7d,0x2b,0x42,0xb4,0x02,0xc6,0x69,0xbf,0x24,0xf7,0xc5,0x25,0x07,0x47,0x63,0x3d,0x0f,0x58,0x91},
+        {0xd0,0x0f,0x21,0x1a,0x7d,0x4f,0x7f,0xb1,0x9b,0xd9,0xb7,0x5d,0x8e,0x93,0x42,0xec,0xcf,0xfb,0x59,0x20,0xb0,0x8f,0xd9,0x56,0x21,0x67,0x56,0x0f,0xdf,0xcc,0x5d,0xd1}
     };
-    return id && !memcmp(id, pins[!!projector][!!content_verified], 32);
+    return id && !memcmp(id, pins[!!projector], 32);
+}
+
+static int vision_tensor_shape(const xe_vision_model *m, const char *name,
+                                uint32_t type, uint32_t dims,
+                                uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
+    const xe_vision_tensor *t=xe_vision_tensor_get(m,name);
+    const uint64_t ne[4]={a,b,c,d};
+    if(!t || t->type!=type || t->dimensions!=dims)return 0;
+    for(uint32_t i=0;i<dims;i++)if(t->ne[i]!=ne[i])return 0;
+    return 1;
+}
+
+/* Every tensor read by the fixed encoder must have its exact type and shape.
+ * A content checksum cannot replace these checks for compatible fine-tunes. */
+static int vision_tensor_schema(const xe_vision_model *m) {
+    if(!vision_tensor_shape(m,"mm.input_projection.weight",1,2,1152,2816,0,0) ||
+       !vision_tensor_shape(m,"v.patch_embd.weight",1,4,16,16,3,1152) ||
+       !vision_tensor_shape(m,"v.position_embd.weight",0,3,1152,10240,2,0) ||
+       !vision_tensor_shape(m,"v.std_bias",0,1,1152,0,0,0) ||
+       !vision_tensor_shape(m,"v.std_scale",0,1,1152,0,0,0))return 0;
+    static const struct { const char *name; uint32_t type; uint64_t a,b; } layer[] = {
+        {"ln1.weight",0,1152,0}, {"ln2.weight",0,1152,0},
+        {"attn_post_norm.weight",0,1152,0}, {"ffn_post_norm.weight",0,1152,0},
+        {"attn_q_norm.weight",0,72,0}, {"attn_k_norm.weight",0,72,0},
+        {"attn_q.weight",1,1152,1152}, {"attn_k.weight",1,1152,1152},
+        {"attn_v.weight",1,1152,1152}, {"attn_out.weight",1,1152,1152},
+        {"ffn_gate.weight",1,1152,4304}, {"ffn_up.weight",1,1152,4304},
+        {"ffn_down.weight",1,4304,1152}
+    };
+    for(int i=0;i<27;i++)for(size_t j=0;j<sizeof layer/sizeof *layer;j++) {
+        char name[128];snprintf(name,sizeof name,"v.blk.%d.%s",i,layer[j].name);
+        if(!vision_tensor_shape(m,name,layer[j].type,layer[j].b?2:1,
+                                layer[j].a,layer[j].b,0,0))return 0;
+    }
+    return 1;
+}
+
+static int vision_metadata(cursor *c,uint64_t count,uint32_t *alignment) {
+    static const struct { const char *name; uint32_t value; } integers[] = {
+        {"clip.vision.projection_dim",2816}, {"clip.vision.patch_size",16},
+        {"clip.vision.embedding_length",1152}, {"clip.vision.feed_forward_length",4304},
+        {"clip.vision.block_count",27}, {"clip.vision.attention.head_count",16},
+        {"clip.vision.image_size",224}
+    };
+    uint32_t seen=0;
+    for(uint64_t i=0;i<count&&!c->bad;i++) {
+        char key[256],value[256];if(!str(c,key,sizeof key))return 0;
+        uint32_t type=u32(c),bit=0;
+        size_t j;
+        for(j=0;j<sizeof integers/sizeof *integers;j++)if(!strcmp(key,integers[j].name))break;
+        if(j<sizeof integers/sizeof *integers) {
+            bit=1u<<j;if(type!=4||u32(c)!=integers[j].value)return 0;
+        } else if(!strcmp(key,"general.architecture") || !strcmp(key,"clip.vision.projector_type")) {
+            int arch=!strcmp(key,"general.architecture");bit=1u<<(arch?7:8);
+            if(type!=8||!str(c,value,sizeof value)||strcmp(value,arch?"clip":"gemma4v"))return 0;
+        } else if(!strcmp(key,"clip.vision.image_mean")||!strcmp(key,"clip.vision.image_std")) {
+            int std=!strcmp(key,"clip.vision.image_std");bit=1u<<(std?10:9);
+            if(type!=9||u32(c)!=6||u64(c)!=3)return 0;
+            for(int k=0;k<3;k++){uint32_t bits=u32(c);float f;memcpy(&f,&bits,4);if(f!=(std?1.0f:0.0f))return 0;}
+        } else if(!strcmp(key,"clip.vision.attention.layer_norm_epsilon")) {
+            bit=1u<<11;if(type!=6)return 0;
+            uint32_t bits=u32(c);float f;memcpy(&f,&bits,4);if(f!=1e-6f)return 0;
+        } else if(!strcmp(key,"clip.has_vision_encoder")||!strcmp(key,"clip.use_gelu")) {
+            bit=1u<<(!strcmp(key,"clip.has_vision_encoder")?12:13);
+            if(type!=7)return 0;
+            const uint8_t *v=take(c,1);if(!v||*v!=1)return 0;
+        } else if(!strcmp(key,"general.alignment")) {
+            bit=1u<<14;if(type!=4)return 0;*alignment=u32(c);
+            if(*alignment<4||(*alignment&(*alignment-1)))return 0;
+        } else skip(c,type,0);
+        if(bit&&(seen&bit))return 0;
+        seen|=bit;
+    }
+    /* clip.use_gelu is absent in the reference GGUF; Gemma4v uses GELU. */
+    return !c->bad&&(seen&0x1fff)==0x1fff;
 }
 
 int xe_vision_model_open(xe_vision_model *m,const char *path,char *error,size_t cap) {
     if(!m||!path)return fail(error,cap,"invalid mmproj argument");
     memset(m,0,sizeof *m);int fd=open(path,O_RDONLY);struct stat st;
     if(fd<0)return fail(error,cap,"cannot open mmproj");
-    if(fstat(fd,&st)||st.st_size!=INT64_C(1193058784)){close(fd);return fail(error,cap,"mmproj size mismatch");}
+    if(fstat(fd,&st)||st.st_size<24||(uint64_t)st.st_size>SIZE_MAX){close(fd);return fail(error,cap,"invalid mmproj size");}
     m->mapping_size=(size_t)st.st_size;m->mapping=mmap(NULL,m->mapping_size,PROT_READ,MAP_PRIVATE,fd,0);close(fd);
     if(m->mapping==MAP_FAILED){m->mapping=NULL;return fail(error,cap,"cannot map mmproj");}
-    format_weights_file_identity(&st, m->file_identity);
-    format_sha256_backend backend = format_sha256_bytes_fast(m->mapping,m->mapping_size,m->sha256);
-    m->content_verified = backend == FORMAT_SHA256_OPENSSL;
-    if (m->content_verified) {
-        if (!xe_vision_weights_fingerprint_matches(m->sha256, 1, 1)) goto bad;
-    } else format_weights_verification_warning(backend, "mmproj");
     cursor c={m->mapping,(const uint8_t *)m->mapping+m->mapping_size,0};
     if(u32(&c)!=UINT32_C(0x46554747)||u32(&c)!=3)goto bad;
     uint64_t nt=u64(&c),nk=u64(&c);if(nt!=356||nk>4096)goto bad;
-    uint32_t alignment=32;int architecture=0,projector=0,width=0;
-    for(uint64_t i=0;i<nk&&!c.bad;i++) {
-        char key[256],value[256];if(!str(&c,key,sizeof key))goto bad;uint32_t type=u32(&c);
-        if(!strcmp(key,"general.architecture")||!strcmp(key,"clip.vision.projector_type")) {
-            if(type!=8||!str(&c,value,sizeof value))goto bad;
-            if(!strcmp(key,"general.architecture"))architecture=!strcmp(value,"clip");
-            else projector=!strcmp(value,"gemma4v");
-        } else if(!strcmp(key,"general.alignment")) {if(type!=4)goto bad;alignment=u32(&c);}
-        else if(!strcmp(key,"clip.vision.projection_dim")) {if(type!=4)goto bad;width=u32(&c);}
-        else skip(&c,type,0);
-    }
-    if(c.bad||!architecture||!projector||width!=2816||!alignment||(alignment&(alignment-1)))goto bad;
+    uint32_t alignment=32;
+    if(!vision_metadata(&c,nk,&alignment))goto bad;
     m->tensors=calloc((size_t)nt,sizeof(*m->tensors));if(!m->tensors)goto bad;
     m->tensor_count=(size_t)nt;
     for(size_t i=0;i<m->tensor_count&&!c.bad;i++) {
@@ -479,18 +536,23 @@ int xe_vision_model_open(xe_vision_model *m,const char *path,char *error,size_t 
     }
     uint64_t offset;if(c.bad||!format_align_u64((uint64_t)(c.p-(const uint8_t *)m->mapping),alignment,&offset)||offset>m->mapping_size)goto bad;
     m->data_offset=(size_t)offset;
-    if (!m->content_verified) {
-        format_weights_metadata_hash(m->mapping, m->data_offset, m->mapping_size, m->sha256);
-        if (!xe_vision_weights_fingerprint_matches(m->sha256, 1, 0)) goto bad;
-    }
     for(size_t i=0;i<m->tensor_count;i++) {
         xe_vision_tensor *t=m->tensors+i;
         if(t->offset%alignment||t->offset>m->mapping_size-offset||t->bytes>m->mapping_size-offset-t->offset)goto bad;
+        for(size_t j=0;j<i;j++) {
+            const xe_vision_tensor *other=m->tensors+j;
+            if(t->offset<other->offset+other->bytes && other->offset<t->offset+t->bytes)goto bad;
+        }
         t->data=(const uint8_t *)m->mapping+offset+t->offset;
     }
+    if(!vision_tensor_schema(m))goto bad;
+    format_sha256_bytes(m->mapping,m->mapping_size,m->sha256);
+    if(!xe_vision_weights_reference(m->sha256,1))
+        fprintf(stderr,"xenolith: vision projector differs from the reference weights; "
+                       "using its full content identity for cache isolation.\n");
     return 1;
 bad:
-    xe_vision_model_close(m);return fail(error,cap,"mmproj fingerprint or schema mismatch");
+    xe_vision_model_close(m);return fail(error,cap,"mmproj schema mismatch");
 }
 
 int xe_image_record_parse(const void *data,size_t bytes,xe_image *meta,

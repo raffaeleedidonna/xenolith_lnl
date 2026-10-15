@@ -14,7 +14,7 @@ int main(int argc, char **argv) {
         return 2;
     }
     const char *model = argv[1];
-    xe_engine *engine = xe_engine_open_with_context(model, context);
+    xe_engine *engine = xe_engine_open_cached(model, context);
     xe_session *session = xe_session_new(engine);
     int32_t ids[72];
     for (int i = 0; i < 64; i++) ids[i] = 2 + i;
@@ -23,7 +23,8 @@ int main(int argc, char **argv) {
 
     float *checkpoint_logits = malloc(XE_VOCAB * sizeof(*checkpoint_logits));
     float *continuation_logits = malloc(XE_VOCAB * sizeof(*continuation_logits));
-    int ok = checkpoint_logits != NULL && continuation_logits != NULL;
+    int ok = checkpoint_logits != NULL && continuation_logits != NULL &&
+             engine->model_content_hash_ready && engine->snapshot_fingerprint_ready;
     if (ok) memcpy(checkpoint_logits, xe_session_logits(session),
                    XE_VOCAB * sizeof(*checkpoint_logits));
 
@@ -33,8 +34,8 @@ int main(int argc, char **argv) {
     if (ok) ok &= xe_session_snapshot_size(session, &snapshot_size) ==
                   XE_SNAPSHOT_OK;
     /* 3.7 finding 1: the first checkpoint of a fresh process must cost
-     * the same as the second (the MODEL fingerprint is no longer a lazy
-     * SHA-256 of the whole GGUF). */
+     * the same as the second (the full MODEL digest is computed at cached opening,
+     * rather than lazily on the first checkpoint). */
     struct timespec t0, t1, t2;
     clock_gettime(CLOCK_MONOTONIC, &t0);
     if (ok) ok &= xe_session_snapshot_save(session, file) == XE_SNAPSHOT_OK;

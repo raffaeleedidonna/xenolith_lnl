@@ -1,17 +1,13 @@
 #define _POSIX_C_SOURCE 200809L
-#if defined(__APPLE__)
-#define _DARWIN_C_SOURCE 1
-#endif
 
 #include "format.h"
 
 #include <limits.h>
 #include <pthread.h>
-#include <stdlib.h>
 #include <string.h>
-#include <sys/stat.h>
-#if defined(__linux__) && !defined(XE_NO_OPENSSL)
-#include <dlfcn.h>
+
+#if defined(__x86_64__) || defined(__i386__)
+#include <immintrin.h>
 #endif
 
 void format_put_u16le(uint8_t *p, uint16_t v) {
@@ -103,25 +99,26 @@ static void format_put_u32be(uint8_t *p, uint32_t v) {
     p[3] = (uint8_t)v;
 }
 
+static const uint32_t format_sha256_k[64] = {
+    0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5,
+    0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+    0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3,
+    0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+    0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc,
+    0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+    0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
+    0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+    0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13,
+    0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+    0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3,
+    0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+    0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5,
+    0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+    0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208,
+    0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2
+};
+
 static void format_sha256_block(format_sha256 *s, const uint8_t block[64]) {
-    static const uint32_t k[64] = {
-        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5,
-        0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
-        0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3,
-        0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
-        0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc,
-        0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
-        0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
-        0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
-        0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13,
-        0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
-        0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3,
-        0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
-        0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5,
-        0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
-        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208,
-        0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2
-    };
     uint32_t w[64];
     for (int i = 0; i < 16; i++) w[i] = format_get_u32be(block + 4 * i);
     for (int i = 16; i < 64; i++) {
@@ -137,7 +134,7 @@ static void format_sha256_block(format_sha256 *s, const uint8_t block[64]) {
         uint32_t s1 = format_rotr32(e, 6) ^ format_rotr32(e, 11) ^
                       format_rotr32(e, 25);
         uint32_t ch = (e & f) ^ (~e & g);
-        uint32_t t1 = h + s1 + ch + k[i] + w[i];
+        uint32_t t1 = h + s1 + ch + format_sha256_k[i] + w[i];
         uint32_t s0 = format_rotr32(a, 2) ^ format_rotr32(a, 13) ^
                       format_rotr32(a, 22);
         uint32_t maj = (a & b) ^ (a & c) ^ (b & c);
@@ -161,11 +158,95 @@ static void format_sha256_block(format_sha256 *s, const uint8_t block[64]) {
     s->h[7] += h;
 }
 
+static void format_sha256_blocks_c(format_sha256 *s, const uint8_t *p,
+                                  size_t blocks) {
+    for (size_t i = 0; i < blocks; i++, p += 64)
+        format_sha256_block(s, p);
+}
+
+#if defined(__x86_64__) || defined(__i386__)
+/* Intel SHA state layout follows Jeffrey Walton's public-domain SHA-Intrinsics
+ * implementation (based on Intel / Sean Gulley):
+ * https://github.com/noloader/SHA-Intrinsics/blob/master/sha256-x86.c
+ * Keep the state in registers across blocks. These instructions are isolated
+ * here so generic host/test builds need no global -msha flag. */
+__attribute__((target("sha,ssse3,sse4.1")))
+static void format_sha256_blocks_sha(format_sha256 *s, const uint8_t *p,
+                                    size_t blocks) {
+    const __m128i swap = _mm_set_epi32(0x0c0d0e0f, 0x08090a0b,
+                                     0x04050607, 0x00010203);
+    __m128i t = _mm_shuffle_epi32(_mm_loadu_si128((const __m128i *)s->h), 0xb1);
+    __m128i cdgh = _mm_shuffle_epi32(
+        _mm_loadu_si128((const __m128i *)(s->h + 4)), 0x1b);
+    __m128i abef = _mm_alignr_epi8(t, cdgh, 8);
+    cdgh = _mm_blend_epi16(cdgh, t, 0xf0);
+
+    for (size_t i = 0; i < blocks; i++, p += 64) {
+        __m128i saved_abef = abef, saved_cdgh = cdgh;
+        __m128i m0 = _mm_shuffle_epi8(_mm_loadu_si128((const __m128i *)p), swap);
+        __m128i m1 = _mm_shuffle_epi8(_mm_loadu_si128((const __m128i *)(p + 16)), swap);
+        __m128i m2 = _mm_shuffle_epi8(_mm_loadu_si128((const __m128i *)(p + 32)), swap);
+        __m128i m3 = _mm_shuffle_epi8(_mm_loadu_si128((const __m128i *)(p + 48)), swap);
+
+        /* Four rounds per group; expand the 16-word rolling message schedule
+         * with SHA instructions. Unrolling keeps all four vectors in registers. */
+#define SHA_ROUNDS(n, m) do { \
+    __m128i wk = _mm_add_epi32((m), _mm_loadu_si128( \
+        (const __m128i *)(format_sha256_k + (n)))); \
+    cdgh = _mm_sha256rnds2_epu32(cdgh, abef, wk); \
+    abef = _mm_sha256rnds2_epu32(abef, cdgh, _mm_shuffle_epi32(wk, 0x0e)); \
+} while (0)
+#define SHA_EXPAND(a, b, c, d) do { \
+    (a) = _mm_sha256msg1_epu32((a), (b)); \
+    (a) = _mm_add_epi32((a), _mm_alignr_epi8((d), (c), 4)); \
+    (a) = _mm_sha256msg2_epu32((a), (d)); \
+} while (0)
+        SHA_ROUNDS(0, m0);
+        SHA_ROUNDS(4, m1);
+        SHA_ROUNDS(8, m2);
+        SHA_ROUNDS(12, m3);
+        SHA_EXPAND(m0, m1, m2, m3); SHA_ROUNDS(16, m0);
+        SHA_EXPAND(m1, m2, m3, m0); SHA_ROUNDS(20, m1);
+        SHA_EXPAND(m2, m3, m0, m1); SHA_ROUNDS(24, m2);
+        SHA_EXPAND(m3, m0, m1, m2); SHA_ROUNDS(28, m3);
+        SHA_EXPAND(m0, m1, m2, m3); SHA_ROUNDS(32, m0);
+        SHA_EXPAND(m1, m2, m3, m0); SHA_ROUNDS(36, m1);
+        SHA_EXPAND(m2, m3, m0, m1); SHA_ROUNDS(40, m2);
+        SHA_EXPAND(m3, m0, m1, m2); SHA_ROUNDS(44, m3);
+        SHA_EXPAND(m0, m1, m2, m3); SHA_ROUNDS(48, m0);
+        SHA_EXPAND(m1, m2, m3, m0); SHA_ROUNDS(52, m1);
+        SHA_EXPAND(m2, m3, m0, m1); SHA_ROUNDS(56, m2);
+        SHA_EXPAND(m3, m0, m1, m2); SHA_ROUNDS(60, m3);
+#undef SHA_EXPAND
+#undef SHA_ROUNDS
+        abef = _mm_add_epi32(abef, saved_abef);
+        cdgh = _mm_add_epi32(cdgh, saved_cdgh);
+    }
+    t = _mm_shuffle_epi32(abef, 0x1b);
+    cdgh = _mm_shuffle_epi32(cdgh, 0xb1);
+    _mm_storeu_si128((__m128i *)s->h, _mm_blend_epi16(t, cdgh, 0xf0));
+    _mm_storeu_si128((__m128i *)(s->h + 4), _mm_alignr_epi8(cdgh, t, 8));
+}
+#endif
+
+static void (*format_sha256_blocks)(format_sha256 *, const uint8_t *, size_t)
+    = format_sha256_blocks_c;
+static pthread_once_t format_sha256_once = PTHREAD_ONCE_INIT;
+
+static void format_sha256_select(void) {
+#if defined(__x86_64__) || defined(__i386__)
+    if (__builtin_cpu_supports("sha") && __builtin_cpu_supports("ssse3") &&
+        __builtin_cpu_supports("sse4.1"))
+        format_sha256_blocks = format_sha256_blocks_sha;
+#endif
+}
+
 void format_sha256_init(format_sha256 *s) {
     static const uint32_t initial[8] = {
         0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
         0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19
     };
+    pthread_once(&format_sha256_once, format_sha256_select);
     memcpy(s->h, initial, sizeof initial);
     s->bytes = 0;
     s->used = 0;
@@ -182,14 +263,15 @@ void format_sha256_update(format_sha256 *s, const void *data, size_t len) {
         p += take;
         len -= take;
         if (s->used == 64) {
-            format_sha256_block(s, s->block);
+            format_sha256_blocks(s, s->block, 1);
             s->used = 0;
         }
     }
-    while (len >= 64) {
-        format_sha256_block(s, p);
-        p += 64;
-        len -= 64;
+    if (len >= 64) {
+        size_t blocks = len / 64;
+        format_sha256_blocks(s, p, blocks);
+        p += blocks * 64;
+        len %= 64;
     }
     if (len) {
         memcpy(s->block, p, len);
@@ -202,12 +284,12 @@ void format_sha256_final(format_sha256 *s, uint8_t out[32]) {
     s->block[s->used++] = 0x80;
     if (s->used > 56) {
         memset(s->block + s->used, 0, 64 - s->used);
-        format_sha256_block(s, s->block);
+        format_sha256_blocks(s, s->block, 1);
         s->used = 0;
     }
     memset(s->block + s->used, 0, 56 - s->used);
     for (int i = 0; i < 8; i++) s->block[56 + i] = (uint8_t)(bits >> (56 - 8 * i));
-    format_sha256_block(s, s->block);
+    format_sha256_blocks(s, s->block, 1);
     for (int i = 0; i < 8; i++) format_put_u32be(out + 4 * i, s->h[i]);
     memset(s, 0, sizeof *s);
 }
@@ -217,92 +299,6 @@ void format_sha256_bytes(const void *data, size_t len, uint8_t out[32]) {
     format_sha256_init(&s);
     format_sha256_update(&s, data, len);
     format_sha256_final(&s, out);
-}
-
-#if defined(__linux__) && !defined(XE_NO_OPENSSL)
-/* Opaque OpenSSL 3 API: loading it is optional and needs no development headers.
- * Keep our successful dlopen reference alive while the function is callable. */
-typedef struct ossl_lib_ctx_st format_ossl_lib_ctx;
-typedef int (*format_ossl_digest_fn)(format_ossl_lib_ctx *, const char *,
-    const char *, const void *, size_t, unsigned char *, size_t *);
-static pthread_once_t format_openssl_once = PTHREAD_ONCE_INIT;
-static void *format_openssl_library;
-static format_ossl_digest_fn format_openssl_digest;
-
-static void format_openssl_init(void) {
-    void *library = dlopen("libcrypto.so.3", RTLD_NOW | RTLD_LOCAL);
-    if (!library) return;
-    void *symbol = dlsym(library, "EVP_Q_digest");
-    if (!symbol || sizeof symbol != sizeof format_openssl_digest) {
-        dlclose(library);
-        return;
-    }
-    memcpy(&format_openssl_digest, &symbol, sizeof format_openssl_digest);
-    format_openssl_library = library;
-}
-#endif
-
-format_sha256_backend format_sha256_bytes_fast(const void *data, size_t len,
-                                               uint8_t out[32]) {
-    const char *mode = getenv("XENOLITH_WEIGHTS_VERIFY");
-    if (mode && !strcmp(mode, "metadata")) return FORMAT_SHA256_DISABLED;
-#if defined(__linux__) && !defined(XE_NO_OPENSSL)
-    pthread_once(&format_openssl_once, format_openssl_init);
-    if (format_openssl_library && format_openssl_digest) {
-        /* EVP_Q_digest accepts an EVP_MAX_MD_SIZE (64-byte) buffer. */
-        uint8_t digest[64];
-        size_t size = 0;
-        if (format_openssl_digest(NULL, "SHA256", NULL, data, len,
-                                  digest, &size) == 1 && size == 32) {
-            memcpy(out, digest, 32);
-            return FORMAT_SHA256_OPENSSL;
-        }
-        return FORMAT_SHA256_FAILED;
-    }
-#endif
-    (void)data; (void)len; (void)out;
-    return FORMAT_SHA256_UNAVAILABLE;
-}
-
-void format_weights_metadata_hash(const void *header, size_t header_len,
-                                  size_t file_size, uint8_t out[32]) {
-    format_sha256 hash; format_sha256_init(&hash);
-    const char domain[] = "xenolith-model-v2";
-    uint8_t sizes[16];
-    format_put_u64le(sizes, file_size);
-    format_put_u64le(sizes + 8, header_len);
-    format_sha256_update(&hash, domain, sizeof domain - 1);
-    format_sha256_update(&hash, sizes, sizeof sizes);
-    format_sha256_update(&hash, header, header_len);
-    format_sha256_final(&hash, out);
-}
-
-void format_weights_file_identity(const struct stat *info, uint8_t out[32]) {
-    uint8_t data[7 * 8];
-    format_put_u64le(data, (uint64_t)info->st_dev);
-    format_put_u64le(data + 8, (uint64_t)info->st_ino);
-    format_put_u64le(data + 16, (uint64_t)info->st_size);
-#if defined(__APPLE__)
-    format_put_u64le(data + 24, (uint64_t)info->st_mtimespec.tv_sec);
-    format_put_u64le(data + 32, (uint64_t)info->st_mtimespec.tv_nsec);
-    format_put_u64le(data + 40, (uint64_t)info->st_ctimespec.tv_sec);
-    format_put_u64le(data + 48, (uint64_t)info->st_ctimespec.tv_nsec);
-#else
-    format_put_u64le(data + 24, (uint64_t)info->st_mtim.tv_sec);
-    format_put_u64le(data + 32, (uint64_t)info->st_mtim.tv_nsec);
-    format_put_u64le(data + 40, (uint64_t)info->st_ctim.tv_sec);
-    format_put_u64le(data + 48, (uint64_t)info->st_ctim.tv_nsec);
-#endif
-    format_sha256_bytes(data, sizeof data, out);
-}
-
-void format_weights_verification_warning(format_sha256_backend reason,
-                                          const char *artifact) {
-    const char *why = reason == FORMAT_SHA256_FAILED ? "OpenSSL SHA-256 failed" :
-        reason == FORMAT_SHA256_DISABLED ? "OpenSSL SHA-256 disabled by XENOLITH_WEIGHTS_VERIFY" :
-        "OpenSSL 3 could not be loaded";
-    fprintf(stderr, "xenolith: warning: %s for %s; using metadata-only weight checks, "
-                    "without full content verification.\n", why, artifact);
 }
 
 int format_read(FILE *f, void *data, size_t len) {

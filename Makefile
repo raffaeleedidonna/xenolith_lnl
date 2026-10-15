@@ -10,8 +10,7 @@ NUMERIC_CFLAGS_HASH=$(shell printf '%s' '$(BASE_CFLAGS)' | sha256sum | cut -d' '
 CFLAGS=$(BASE_CFLAGS) -DXE_BUILD_COMMIT='"$(BUILD_COMMIT)"' \
 	-DXE_NUMERIC_SOURCE_HASH='"$(NUMERIC_SOURCE_HASH)"' \
 	-DXE_NUMERIC_CFLAGS_HASH='"$(NUMERIC_CFLAGS_HASH)"'
-FORMAT_LDLIBS=$(if $(filter Linux,$(shell uname -s)),-ldl)
-LDLIBS=-lm -lze_loader $(FORMAT_LDLIBS)
+LDLIBS=-lm -lze_loader
 
 GPU_SPV=xenolith_gpu.spv
 GPU_OBJ=xenolith_gpu_spv.o
@@ -31,7 +30,7 @@ serve.o: serve.c serve.h vision_serve.inc format.h runtime.h xenolith.h kvstore.
 main.o profile.o kvstore.o conversation.o runtime.o serve.o: vision.h
 
 clean:
-	rm -f tests/test_visual_cache
+	rm -f tests/test_visual_cache tests/test_visual_replay
 	rm -f *.o xenolith tests/test_cache_policy tests/test_cache_model tests/certify tests/test_kv tests/test_kv_model tests/test_decode tests/test_context_limits \
 		tests/test_model_decode tests/test_fixture_decode bench/bench_decode \
 		tests/test_prefill_projection tests/test_prefill_qkv tests/test_prefill_swa \
@@ -47,7 +46,7 @@ clean:
 		bench/bench_guard bench/compare_pp_tg_xe bench/compare_pp_tg_tokens \
 		bench/bench_b3b.spv bench/bench_b3b_adlp.spv \
 		bench/bench_prefill_gemm bench/bench_prefill_gemm_down \
-		bench/bench_prefill_gemm.spv $(GPU_SPV) $(TEST_TOOLS) tests/test_vision_input tests/test_vision_gpu tests/test_vision_session tests/test_text_batch_model tools/vision_prepare tests/test_sha256_fast tests/test_weights_identity
+		bench/bench_prefill_gemm.spv $(GPU_SPV) $(TEST_TOOLS) tests/test_vision_input tests/test_vision_gpu tests/test_vision_session tests/test_text_batch_model tools/vision_prepare tests/test_sha256 tests/test_weights_identity
 
 $(GPU_SPV): xenolith.cl vision.cl
 	# Xe-LP is the SPIR-V feature baseline; native code is compiled at startup.
@@ -67,7 +66,7 @@ LLAMA_LDLIBS=-lllama -lggml -lggml-base
 
 TEST_CFLAGS=-O2 -std=c11 -Wall -Wextra -pthread
 
-UNIT_TESTS=tests/test_inference tests/test_format tests/test_sha256_fast tests/test_json tests/test_decode tests/test_conversation tests/test_gpu_alloc tests/test_context_limits tests/test_visual_cache
+UNIT_TESTS=tests/test_inference tests/test_format tests/test_sha256 tests/test_json tests/test_decode tests/test_conversation tests/test_gpu_alloc tests/test_context_limits tests/test_visual_cache tests/test_visual_replay
 GPU_TESTS=tests/test_kv tests/test_snapshot tests/test_kvstore tests/test_prefill_session
 PERSISTENCE_TESTS=tests/test_cache_model tests/test_snapshot_model tests/test_conversation_model tests/test_session_sync
 PREFILL_TESTS=tests/test_prefill_projection tests/test_prefill_qkv tests/test_prefill_swa \
@@ -109,10 +108,11 @@ check-context: tests/test_cli_context
 	./tests/test_cli_context
 
 tests/test_format: tests/test_format.c format.o format.h
-	$(CC) $(TEST_CFLAGS) -I. -o $@ tests/test_format.c format.o -pthread $(FORMAT_LDLIBS)
+	$(CC) $(TEST_CFLAGS) -I. -o $@ tests/test_format.c format.o -pthread
 
-tests/test_sha256_fast: tests/test_sha256_fast.c format.o format.h
-	$(CC) $(TEST_CFLAGS) -I. -o $@ $< format.o $(FORMAT_LDLIBS)
+# Compile without -march=native to exercise runtime SHA dispatch in host builds.
+tests/test_sha256: tests/test_sha256.c format.c format.h
+	$(CC) $(TEST_CFLAGS) -I. -o $@ $<
 
 tests/test_json: tests/test_json.c json.o json.h
 	$(CC) $(TEST_CFLAGS) -I. -o $@ tests/test_json.c json.o -pthread -lm
@@ -277,7 +277,10 @@ check-snapshot-compat: $(GPU_OBJ)
 check-snapshot-compat-model: require-model $(GPU_OBJ)
 	python3 tests/check_snapshot_compat.py --cc '$(CC)' --base-cflags '$(BASE_CFLAGS)' $(if $(LEGACY_SOURCE),--legacy-source '$(LEGACY_SOURCE)') --model '$(MODEL)'
 
-check-unit: tests/test_cache_policy $(UNIT_TESTS) check-kv-load-bounds check-snapshot-compat-host
+check-vision-weights:
+	CC='$(CC)' python3 tests/check_vision_weights.py
+
+check-unit: check-vision-weights tests/test_cache_policy $(UNIT_TESTS) check-kv-load-bounds check-snapshot-compat-host
 	./tests/test_cache_policy
 	@set -e; for test in $(UNIT_TESTS); do ./$$test; done
 
@@ -362,16 +365,16 @@ require-model:
 
 .PHONY: check-cache-large require-model clean check check-inference check-unit check-gpu check-context check-persistence check-prefill check-all check-snapshot-compat-host check-snapshot-compat \
 	check-snapshot-compat-model check-kv check-kv-edges check-kv-load-bounds check-runtime check-serve golden test-tools test-tools-clean \
-	bench-b3b bench-b14 bench-prefill-gemm check-vision
+	bench-b3b bench-b14 bench-prefill-gemm check-vision check-vision-weights
 
 vision.o: vision.c vision.h format.h vendor/stb/stb_image.h
 	$(CC) $(CFLAGS) -c vision.c -o $@
 
 tests/test_vision_input: tests/test_vision_input.c vision.o format.o
-	$(CC) $(TEST_CFLAGS) -o $@ $^ -lm $(FORMAT_LDLIBS)
+	$(CC) $(TEST_CFLAGS) -o $@ $^ -lm
 
 tools/vision_prepare: tools/vision_prepare.c vision.o format.o
-	$(CC) $(TEST_CFLAGS) -o $@ $^ -lm $(FORMAT_LDLIBS)
+	$(CC) $(TEST_CFLAGS) -o $@ $^ -lm
 
 tests/test_vision_gpu: tests/test_vision_gpu.c xenolith.c xenolith.h vision_gpu.inc vision.o format.o $(GPU_OBJ)
 	$(CC) $(CFLAGS) -I. -o $@ $< vision.o format.o $(GPU_OBJ) $(LDLIBS)
@@ -388,3 +391,7 @@ tests/test_text_batch_model: tests/test_text_batch_model.c xenolith.o xenolith.h
 
 tests/test_weights_identity: tests/test_weights_identity.c xenolith.c xenolith.h format.h $(NUMERIC_SOURCES) vision.o format.o $(GPU_OBJ)
 	$(CC) $(CFLAGS) -I. -o $@ $< vision.o format.o $(GPU_OBJ) $(LDLIBS)
+
+# Exercise visual media replay with deterministic encoding and real storage.
+tests/test_visual_replay: tests/test_visual_replay.c runtime.c runtime.h vision_runtime.inc xenolith.h xenolith_internal.h $(NUMERIC_SOURCES) profile.o json.o conversation.o kvstore.o format.o vision.o $(GPU_OBJ)
+	$(CC) $(CFLAGS) -I. -o $@ $< profile.o json.o conversation.o kvstore.o format.o vision.o $(GPU_OBJ) $(LDLIBS)
