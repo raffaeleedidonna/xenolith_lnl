@@ -991,7 +991,8 @@ static int cmd_wire(const char *model, int argc, char **argv) {
     cli_state_dir(state_option, state_dir, sizeof state_dir);
     cli_lock(NULL);
 
-    xe_engine *e = xe_engine_open_with_context(model, context);
+    xe_engine *e = cache_budget ? xe_engine_open_cached(model, context)
+                                : xe_engine_open_with_context(model, context);
     int status = serve_stdio_with_budget(e, state_dir, cache_dir, cache_budget);
     xe_engine_close(e);
     cli_unlock();
@@ -1039,7 +1040,8 @@ static int cmd_serve(const char *model, int argc, char **argv) {
     }
     cli_lock(socket_path);
 
-    xe_engine *e = xe_engine_open_with_context(model, context);
+    xe_engine *e = cache_budget ? xe_engine_open_cached(model, context)
+                                : xe_engine_open_with_context(model, context);
     int status = serve_run_with_budget(e, state_dir, cache_dir, socket_path,
                            idle_minutes, cache_budget);
     xe_engine_close(e);

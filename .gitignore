@@ -44,6 +44,7 @@
 /tests/test_decode
 /tests/test_fixture_decode
 /tests/test_format
+/tests/test_sha256
 /tests/test_gpu_alloc
 /tests/test_json
 /tests/test_kv

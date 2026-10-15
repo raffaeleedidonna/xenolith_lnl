@@ -30,6 +30,24 @@ available, otherwise `wire.sock` inside the state directory. Default state and
 cache directories are `$XDG_STATE_HOME/xenolith` and `$XDG_CACHE_HOME/xenolith/kv`,
 falling back to `~/.local/state/xenolith` and `~/.cache/xenolith/kv`.
 
+`--cache-budget` also determines model fingerprint preparation. With a positive
+budget (including the default), `serve` and `wire` compute the full GGUF SHA-256
+once during startup, before repacking releases source pages. All snapshot
+fingerprints are ready before the socket accepts clients or stdin requests are
+processed. Startup diagnostics go to stderr; fingerprint computation does not
+occur during prefill, decode or finalization.
+
+With `--cache-budget 0`, startup skips model fingerprint computation as well as
+disk KV cache reads and writes. Durable conversation history and in-memory KV
+reuse still work. The standalone `chat`, `run`, `info`, `oracle` and `bench`
+commands also skip model fingerprint computation.
+
+This is a service-wide startup decision, not a per-request choice. An
+`ephemeral` request sent to a cache-enabled service still uses an engine whose
+fingerprints were prepared at startup. For an ephemeral-only service that
+avoids this work, start it with `--cache-budget 0`. A positive budget prepares
+the fingerprints even if opening the cache directory later fails.
+
 Each frame is one JSON object followed by a newline. Escape newlines inside
 strings; do not pretty-print a frame across lines. There are no request IDs or
 unsolicited greetings. Diagnostics go to stderr. Read continuously while a
@@ -343,10 +361,17 @@ point is missing or rejected, restoration tries earlier compatible points in
 the current cache epoch before rebuilding. Resuming an earlier point requires
 prefill for the remaining transcript.
 
-Compatible v1 snapshots from `68b8fbf55` remain readable without conversion,
-subject to matching build and numerical settings; other v1 producers remain
-unsupported. Incompatible cache falls back to prefill. Older engines cannot
-read the new checkpoint format.
+Checkpoint model identity is the SHA-256 of the complete GGUF, including tensor
+values. A compatible fine-tune can be loaded, but cannot reuse another model's
+computed state. A mismatch reports `model_mismatch` and falls back to prefill
+from the retained transcript. Moving or copying identical model bytes does not
+invalidate this identity.
+
+Older checkpoints with header-only model identities, including v1 from
+`68b8fbf55` and earlier v2 writers, are rejected as `model_mismatch` and rebuilt.
+Their original tensor contents cannot be verified retroactively. The checkpoint
+layout remains v2 and its numerical ABI is unchanged; current writers continue
+to support reuse across builds with compatible numerical settings.
 
 ## History and rewinding
 
