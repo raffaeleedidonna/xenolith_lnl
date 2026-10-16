@@ -125,3 +125,125 @@ the numerical identity match. Preprocessing and media integrity remain mandatory
 For services, vision identities are prepared at startup even with a zero disk
 cache budget; text-only services follow `--cache-budget` as described in
 [PROTOCOL.md](PROTOCOL.md).
+
+## Validation
+
+Run commands from the repository root. The engine has no Python or llama.cpp
+runtime dependency. Python 3 is used by the checks; Pillow and NumPy are optional
+dependencies for independent reference generation. The recorded versions,
+source hashes and artifact identities are in [the manifest](tests/vision/manifest.json).
+
+`tests/vision/` holds checks, fixtures and reference metadata. `tools/` holds
+artifact verification, fixture generation, preprocessing and numerical oracles.
+`tests/vision/results/` contains historical reports for the revisions recorded
+inside them; a report named `final` does not certify the current checkout.
+Use a new output directory for each validation run. The Python integration
+checks refuse existing directories so they cannot reuse old success reports or
+modify an existing session/cache.
+
+### Host and GPU checks
+
+```sh
+make check-unit check-context
+make check-gpu
+```
+
+The first command needs no model or GPU device. The second needs a supported
+GPU, but no weights. `make check-vision` is a focused shortcut for the image
+input and GPU attention/ring checks already included in those suites.
+
+For preprocessing comparison, build `tools/vision_prepare`, obtain the pinned
+Transformers reference files with `python3 tools/vision_artifacts.py --references`,
+and install the manifest's Pillow version in a development environment. The
+artifact utility verifies local files; add `--download` to download missing
+projector/reference files into its `--directory` (default `.vision-cache`).
+
+```sh
+make tools/vision_prepare
+python3 tests/vision/check_preprocess.py --output /tmp/xe-preprocess-new
+```
+
+This compares EXIF orientation, alpha compositing, resizing and all five image
+budgets, with a separate JPEG pixel tolerance. `python3 tools/vision_fixtures.py`
+regenerates reference fixtures; do not regenerate committed fixtures merely to
+make a candidate pass.
+
+### Model and session checks
+
+Set `MODEL` and `MMPROJ` to the pinned GGUF files. The scripts create their own
+state/cache under the supplied fresh output directory:
+
+```sh
+python3 tests/vision/check_wire.py --engine ./xenolith \
+  --model "$MODEL" --mmproj "$MMPROJ" --output /tmp/xe-wire-new
+python3 tests/vision/check_wire.py --engine ./xenolith \
+  --model "$MODEL" --mmproj "$MMPROJ" --large --output /tmp/xe-wire-large-new
+python3 tests/vision/check_chat.py --engine ./xenolith \
+  --model "$MODEL" --mmproj "$MMPROJ" --output /tmp/xe-chat-new
+make check-text-batch-model MODEL="$MODEL" TEST_CONTEXT=65536
+```
+
+The wire suite covers image transport, retained media, multiple images, rewind,
+rebuild, ephemeral requests, checkpoints and restart. `--large` selects the
+separate 131072-context/1120-row checkpoint and restart scenario. Chat uses the
+included quadrant image and checks both answers, plus two text-only turns.
+The text batch check compares prefill sizes 512 and 1024; repeat it with
+`TEST_CONTEXT=131072` for the larger capacity.
+
+For C session lifecycle checks, produce a matching `prompt.ids` and
+`embedding.f32` using `xenolith run` with `--image`, `--mmproj` and
+`--vision-dump DIR` (create `DIR` first). Then run:
+
+```sh
+make check-vision-session-model MODEL="$MODEL" TEST_CONTEXT=65536 \
+  VISION_PROMPT_IDS=/path/to/dump/prompt.ids \
+  VISION_EMBEDDING=/path/to/dump/embedding.f32
+```
+
+The prompt must contain the matching image span. This check exercises identity,
+snapshot restore, shadow ownership, promotion, replay and rewind without
+rerunning the encoder. It is distinct from encoder numerical validation.
+
+`make check-weights-identity` takes `MODEL`, `MMPROJ`, `MMPROJ_VARIANT`
+(a compatible projector with changed tensor bytes) and `MMPROJ_INVALID`
+(invalid projector metadata). It needs the pinned originals and separate test
+variants, but no GPU device. Never mutate the original weight files.
+
+`python3 tests/vision/check_cache.py --help` describes the migration check. Its
+`--previous-engine` must be a pre-integration build that writes the older
+visual-v2 snapshots; an arbitrary second build is not a valid substitute.
+The script checks replay into the current format, predecessor recovery and
+disabled caches using disposable state.
+
+### Independent numerical references
+
+The C++ encoder and decoder oracles require two separate llama.cpp checkouts
+at `references.llama_cpp_commit` from the manifest. Apply
+`python3 tools/vision_reference_patch.py /path/to/encoder-checkout` only to the
+encoder copy: its F32 GELU adapter is necessary for the pinned vision model.
+Keep the decoder copy unmodified. Build shared CPU libraries in each checkout's
+`build-cpu`, including `mtmd` for the encoder. Use the manifest's
+`ggml_cpu_options` for reproducible reference builds. Then compile the wrappers:
+
+```sh
+make vision-reference-tools \
+  LLAMA_VISION_DIR=/path/to/encoder-checkout \
+  LLAMA_DECODE_DIR=/path/to/decoder-checkout
+```
+
+Override `LLAMA_VISION_BUILD` and `LLAMA_DECODE_BUILD` for other build directories.
+The targets check the pinned revisions, GELU source variant and source/build
+association. These checks do not replace rebuilding libraries after source
+changes. Neither target downloads dependencies nor changes their sources.
+
+`tools/vision_prepare IMAGE BUDGET prepared.rgb` produces the resized pixels
+consumed by `tools/vision_reference MMPROJ prepared.rgb OUTPUT_DIR` and
+`python3 tools/vision_numpy_reference.py MMPROJ prepared.rgb OUTPUT_DIR`. Compare encoder
+dumps with `python3 tools/vision_compare.py REFERENCE_DIR CANDIDATE_DIR --output REPORT`;
+its default checks all 30 selected stages with fixed RMS/cosine limits.
+The decoder oracle accepts `MODEL IDS EMBEDDING START ROWS CONTEXT OUTPUT_PREFIX`;
+use the same prompt/span and projected rows as the candidate.
+
+For timing, use `python3 bench/text_regression.py --help`. It records the text
+matrix or paired ABBA runs, executable identities and commands. Successful
+measurement collection is not a numerical or performance regression verdict.

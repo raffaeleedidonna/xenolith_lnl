@@ -101,7 +101,7 @@ Send `{"op":"describe"}` first. The reply contains:
 | Field | Meaning |
 |---|---|
 | `ok` | `true`. |
-| `protocol` | `1`. Reject versions your client does not support. |
+| `protocol` | `1` for text-only services, `2` when vision is enabled. Reject versions your client does not support. |
 | `model` | Served model identifier; there is no model-selection field on requests. |
 | `context_window` | Maximum context size in tokens. |
 | `max_output` | Advertised output limit. Available context can impose a lower limit. |

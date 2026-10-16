@@ -171,8 +171,22 @@ checkout.
 - `make check-unit check-context`: host and CLI checks, without a GPU or model.
   Requires Python 3 and a C compiler with AddressSanitizer support.
 - `make check-gpu`: numerical GPU regressions, requiring a supported GPU but no model.
-- `make check-all MODEL=/path/to/model.gguf`: the full suite, including model,
+- `make check-all MODEL=/path/to/model.gguf`: the standard suite, including model,
   persistence, prefill, runtime and server checks; requires a supported GPU and model.
+
+Vision input checks are included in `check-unit`, and vision attention/ring
+checks in `check-gpu`. `make check-vision` runs those two focused checks together.
+Checks requiring a projector or projected image fixtures are explicit opt-in
+commands; see [vision validation](VISION.md#validation).
+
+Development utilities live in `tools/`, executable checks and fixtures in
+`tests/`, and performance experiments in `bench/`. The text regression matrix
+is `bench/text_regression.py`; it compares separately built executables and
+also supports candidate-only measurements. `bench/bench_prefill_gemm.c` and
+its OpenCL companion are an experimental kernel lab pinned to device `a7a0`,
+including candidate kernels that are not used by the engine. They are not a
+portable regression suite. The end-to-end benchmark procedure remains in
+[bench/compare_pp_tg.md](bench/compare_pp_tg.md).
 
 <details>
 <summary>KV regression checks and kernel optimization guidance</summary>
