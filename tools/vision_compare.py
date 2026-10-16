@@ -17,6 +17,8 @@ p.add_argument("candidate",type=Path)
 p.add_argument("--output",type=Path)
 p.add_argument("--stage",action="append",choices=['pos_embd']+[f'layer_out-{i}' for i in range(27)]+['std_scaled','embedding'],help="Compare selected stages; default: all 30 stages")
 a=p.parse_args()
+if a.output and a.output.exists():
+    p.error('--output must be a new report path to avoid stale comparison results')
 results=[];ok=True
 for name in a.stage or ['pos_embd']+[f'layer_out-{i}' for i in range(27)]+['std_scaled','embedding']:
     rp=a.reference/(name+'.f32')
@@ -45,5 +47,7 @@ for name in a.stage or ['pos_embd']+[f'layer_out-{i}' for i in range(27)]+['std_
     ok &= passed
     print(name,f'rms {rms:.6g} cosine {cosine:.9f}', 'PASS' if passed else 'FAIL')
 report={'limits':{'relative_rms':0.005,'cosine':0.99998},'pass':ok,'stages':results}
-if a.output:a.output.write_text(json.dumps(report,indent=2)+'\n')
+if a.output:
+    with a.output.open('x') as output:
+        output.write(json.dumps(report,indent=2)+'\n')
 raise SystemExit(0 if ok else 1)

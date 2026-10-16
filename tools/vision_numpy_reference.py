@@ -16,12 +16,27 @@ from vision_artifacts import inventory,digest
 p=argparse.ArgumentParser(description=__doc__)
 p.add_argument("mmproj",type=Path)
 p.add_argument("prepared",type=Path)
-p.add_argument("output",type=Path)
+p.add_argument("output",type=Path,help="New directory; existing paths are rejected")
 p.add_argument("--layers",type=int,default=27)
-a=p.parse_args();a.output.mkdir(parents=True,exist_ok=True)
+a=p.parse_args()
 lock=json.loads((Path(__file__).resolve().parent.parent/"tests/vision/manifest.json").read_text())
+if np.__version__ != lock['references']['numpy_version']:
+    p.error(f"requires NumPy {lock['references']['numpy_version']}; found {np.__version__}")
+if not 1 <= a.layers <= 27:
+    p.error('--layers must be between 1 and 27; use 27 for a complete encoder reference')
 artifact=next(v for v in lock['artifacts'] if v['filename']=='mmproj-F16.gguf')
-assert digest(a.mmproj)==artifact['sha256']
+if not a.mmproj.is_file() or a.mmproj.stat().st_size != artifact['size_bytes'] or digest(a.mmproj) != artifact['sha256']:
+    p.error('mmproj must match the pinned mmproj-F16.gguf SHA-256')
+raw=a.prepared.read_bytes()
+if len(raw) < 8:
+    p.error('prepared RGB input must contain a width/height header')
+w,h=struct.unpack('<II',raw[:8])
+if not w or not h or w%48 or h%48 or w*h > 1120*48*48 or len(raw) != 8+w*h*3:
+    p.error('prepared RGB input must have positive dimensions divisible by 48, at most 1120 pooled rows, and exactly width*height*3 pixel bytes')
+try:
+    a.output.mkdir(parents=True,exist_ok=False)
+except FileExistsError:
+    p.error('output must be a new directory to avoid stale reference stages')
 info=inventory(a.mmproj);tensors={t['name']:t for t in info['tensors']}
 def tensor(name):
     t=tensors[name]
@@ -37,7 +52,6 @@ def save(name,x):
     x.astype('<f4').tofile(a.output/(name+'.f32'))
     (a.output/(name+'.json')).write_text(json.dumps({'shape':list(x.shape),'sha256':hashlib.sha256(x.astype('<f4').tobytes()).hexdigest()}))
 
-raw=a.prepared.read_bytes();w,h=struct.unpack('<II',raw[:8]);assert w%48==h%48==0
 pixels=np.frombuffer(raw[8:],np.uint8).reshape(h,w,3).astype(np.float32)/255
 px,py=w//16,h//16;n=px*py
 patches=(pixels*2-1).reshape(py,16,px,16,3).transpose(0,2,4,1,3).reshape(n,768)
@@ -87,4 +101,5 @@ save('pooled',pooled)
 scaled=(pooled-tensor('v.std_bias'))*tensor('v.std_scale');save('std_scaled',scaled)
 embedding=mm(norm(scaled),'mm.input_projection.weight');save('embedding',embedding)
 (a.output/'manifest.json').write_text(json.dumps({'numpy_version':np.__version__,'mmproj_sha256':artifact['sha256'],
-    'prepared_sha256':hashlib.sha256(raw).hexdigest(),'rows':len(embedding),'width':2816,'revision':'numpy-gemma4v-f16-dots/v1'},indent=2)+'\n')
+    'prepared_sha256':hashlib.sha256(raw).hexdigest(),'layers':a.layers,'complete_encoder':a.layers==27,
+    'rows':len(embedding),'width':2816,'revision':'numpy-gemma4v-f16-dots/v1'},indent=2)+'\n')
