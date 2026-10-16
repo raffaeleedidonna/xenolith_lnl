@@ -35,7 +35,7 @@ alpha.putdata([(x*5%256, y*7%256, (x+y)*9%256, (x*7+y*11)%256) for y in range(29
 path = a.output / 'alpha.png'; alpha.save(path); cases.append((path, 70, 0))
 for name in ['quadrants', 'wide', 'portrait']:
     for budget in [70, 140, 280, 560, 1120]:
-        cases.append((root / 'vision/fixtures' / (name+'.png'), budget, 0))
+        cases.append((root / 'tests/vision/fixtures' / (name+'.png'), budget, 0))
 report = []
 for path, budget, tolerance in cases:
     reference = ImageOps.exif_transpose(Image.open(path)).convert('RGBA')
@@ -53,7 +53,7 @@ for path, budget, tolerance in cases:
                    'input_sha256': hashlib.sha256(path.read_bytes()).hexdigest()})
     print(path.name, budget, maximum, 'PASS' if maximum <= tolerance else 'FAIL')
 # Truncation and malformed orientation fail without returning an image.
-bad = a.output / 'truncated.png'; bad.write_bytes((root/'vision/fixtures/quadrants.png').read_bytes()[:64])
+bad = a.output / 'truncated.png'; bad.write_bytes((root/'tests/vision/fixtures/quadrants.png').read_bytes()[:64])
 assert subprocess.run([str(a.prepare), str(bad), '70', str(a.output/'bad.rgb')], capture_output=True).returncode != 0
 (a.output / 'report.json').write_text(json.dumps(report, indent=2)+'\n')
 raise SystemExit(0 if all(row['pass'] for row in report) else 1)

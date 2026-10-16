@@ -68,7 +68,7 @@ def inventory(path):
 
 def main():
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--manifest", type=Path, default=ROOT/"vision/manifest.json")
+    p.add_argument("--manifest", type=Path, default=ROOT/"tests/vision/manifest.json")
     p.add_argument("--directory", type=Path, default=ROOT/".vision-cache")
     p.add_argument("--download", action="store_true")
     p.add_argument("--model", type=Path)

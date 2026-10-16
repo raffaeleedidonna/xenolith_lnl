@@ -82,7 +82,7 @@
 
 /.vision-cache/
 /vision-runs/
-/vision/fixtures/*.rgb
+/tests/vision/fixtures/*.rgb
 /tools/vision_prepare
 /tools/vision_reference
 /tests/test_vision_input

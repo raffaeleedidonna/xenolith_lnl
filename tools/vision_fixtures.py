@@ -12,7 +12,7 @@ import PIL
 
 root=Path(__file__).resolve().parent.parent
 p=argparse.ArgumentParser(description=__doc__)
-p.add_argument("--output",type=Path,default=root/"vision/fixtures")
+p.add_argument("--output",type=Path,default=root/"tests/vision/fixtures")
 a=p.parse_args();a.output.mkdir(parents=True,exist_ok=True)
 source=root/".vision-cache/reference/image_processing_gemma4.py"
 tree=ast.parse(source.read_text())

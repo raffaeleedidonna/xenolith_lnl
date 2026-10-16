@@ -32,7 +32,7 @@ falling back to `~/.local/state/xenolith` and `~/.cache/xenolith/kv`.
 
 Without `--mmproj`, the service exposes the existing text-only protocol 1.
 With `--mmproj /path/to/mmproj-F16.gguf`, it exposes protocol 2 with images,
-with the reference artifacts documented in [vision/manifest.json](vision/manifest.json).
+with the reference artifacts documented in [tests/vision/manifest.json](tests/vision/manifest.json).
 Vision defaults to context 65536 and accepts only `--ctx 65536|131072`.
 Clients must inspect `describe.protocol` and `describe.vision` before sending
 images. A protocol 1 service rejects image requests and visual conversations.

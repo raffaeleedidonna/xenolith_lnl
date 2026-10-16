@@ -101,7 +101,7 @@ across processes and would prevent persistent reuse. The native module binds
 compiler output while remaining stable across validated restarts.
 
 The opt-in wire protocol v2 exposes images, media references and retrieval;
-see [PROTOCOL.md](../PROTOCOL.md). Protocol v1 remains text-only. Runtime visual
+see [PROTOCOL.md](PROTOCOL.md). Protocol v1 remains text-only. Runtime visual
 replay is synchronous; its asynchronous shadow prefill optimization is disabled
 for visual prompts. Core shadow/COW and promotion still support owned images.
 
@@ -124,4 +124,4 @@ Recorded embedding identity is compared only when both weight identities and
 the numerical identity match. Preprocessing and media integrity remain mandatory.
 For services, vision identities are prepared at startup even with a zero disk
 cache budget; text-only services follow `--cache-budget` as described in
-[PROTOCOL.md](../PROTOCOL.md).
+[PROTOCOL.md](PROTOCOL.md).

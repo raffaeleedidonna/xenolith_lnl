@@ -1,4 +1,4 @@
-// Numerical oracle, built against the commit in vision/manifest.json.
+// Numerical oracle, built against the commit in tests/vision/manifest.json.
 #include "clip.h"
 #include "clip-impl.h"
 #include "clip-model.h"

@@ -102,7 +102,7 @@ the [protocol](PROTOCOL.md) and the [C API](xenolith.h).
 
 The native CLI can answer questions about a PNG or JPEG using the pinned Gemma
 4 26B-A4B QAT model and its F16 mmproj. Artifact versions and SHA-256 values are
-in [vision/manifest.json](vision/manifest.json). The loader rejects incompatible
+in [tests/vision/manifest.json](tests/vision/manifest.json). The loader rejects incompatible
 weights. Use 65536 or 131072 context elements for initial validation:
 
 ```sh
@@ -131,20 +131,12 @@ rows depends on aspect ratio. EXIF orientation is applied and alpha is
 composited on white. Limits are 64 MiB encoded and 32 million decoded pixels
 per image. The first CLI implementation releases encoder allocations before
 loading the language model. High budgets still have substantial encoder cost.
-On Linux, startup uses the optional OpenSSL 3 `libcrypto.so.3` library to
-verify complete model and projector SHA-256 hashes. No OpenSSL development
-headers are required. If loading OpenSSL or computing the digest fails, the
-loader prints a warning and uses the pre-vision-style header/metadata checks,
-without scanning all tensor bytes with the generic C hash. That fallback checks
-compatibility, not full tensor-content integrity. Encoder and prefill timings
-are separate from verification and loading.
-
-`XENOLITH_WEIGHTS_VERIFY=metadata` explicitly selects the fast metadata policy
-for diagnostics and fallback tests, with a warning. Both policies validate file
-size, GGUF metadata and tensor schema against the pinned artifact definitions.
-Computed caches bind the policy; metadata-mode caches also bind inode/device
-and modification/status-change timestamps. Persisted media can be replayed
-when verification mode changes.
+Startup computes complete model and projector SHA-256 hashes using the in-tree
+implementation, with Intel SHA acceleration when available. The loader checks
+architecture, required metadata and tensor types/shapes. Compatible weight
+variants can load; reference hashes are diagnostic, and full content identities
+isolate their computed caches. Persisted media can be replayed after a weight
+change. Encoder and prefill timings are separate from verification and loading.
 
 Visual sessions use shared global-KV checkpoint segments and visual snapshot
 format v3 alongside upstream's text snapshot v2. Earlier visual snapshots replay
@@ -161,14 +153,18 @@ or use `vision-encode` with the same model/image/mmproj options. Add
 `--final-only` to save only the projected embeddings, without
 intermediate tracing; the output directory must already exist. Run
 `make check-vision` for portable input checks and the target GPU mask/ring tests.
-See [VISION_PLAN.md](VISION_PLAN.md) and [the input contract](vision/INPUT_FORMAT.md)
-for references, identity and session primitives. `wire` and `serve` accept
-`--mmproj FILE` to expose the opt-in image protocol v2, with durable media,
+See [the visual input contract](VISION.md) for identity and session primitives.
+`wire` and `serve` accept `--mmproj FILE` to expose the opt-in image protocol v2,
+with durable media,
 visual snapshots, replay, rewind, rebuild and ephemeral messages. Without that
 option they retain text protocol v1. See [PROTOCOL.md](PROTOCOL.md) for image
 transport and media retrieval. Xenopi needs a client update to use this protocol.
-Measured correctness, regressions and remaining performance/quality limits
-are recorded in [vision/VALIDATION.md](vision/VALIDATION.md).
+Validation fixtures, pinned reference metadata and historical reports are in
+[tests/vision](tests/vision). These files support tests and reference tools;
+the engine does not load them at runtime. Reports in
+[tests/vision/results](tests/vision/results) describe their recorded revisions
+and environments, including superseded implementations, rather than the current
+checkout.
 
 ## Testing
 

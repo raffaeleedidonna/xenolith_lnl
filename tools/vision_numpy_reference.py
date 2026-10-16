@@ -19,7 +19,7 @@ p.add_argument("prepared",type=Path)
 p.add_argument("output",type=Path)
 p.add_argument("--layers",type=int,default=27)
 a=p.parse_args();a.output.mkdir(parents=True,exist_ok=True)
-lock=json.loads((Path(__file__).resolve().parent.parent/"vision/manifest.json").read_text())
+lock=json.loads((Path(__file__).resolve().parent.parent/"tests/vision/manifest.json").read_text())
 artifact=next(v for v in lock['artifacts'] if v['filename']=='mmproj-F16.gguf')
 assert digest(a.mmproj)==artifact['sha256']
 info=inventory(a.mmproj);tensors={t['name']:t for t in info['tensors']}

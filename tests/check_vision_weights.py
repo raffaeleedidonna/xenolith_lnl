@@ -66,7 +66,7 @@ def write_gguf(path, spec, duplicate=None):
 
 
 def main():
-    spec = json.loads((ROOT / 'vision/mmproj-inventory.json').read_text())
+    spec = json.loads((ROOT / 'tests/vision/mmproj-inventory.json').read_text())
     with tempfile.TemporaryDirectory(prefix='xenolith-vision-weights-') as directory:
         tmp = Path(directory)
         wrapper = tmp / 'loader.c'
