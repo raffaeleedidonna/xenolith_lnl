@@ -81,6 +81,8 @@ def main():
                 command += [source / "vision.c"]
             if (source / "vision_encoder.c").is_file():
                 command += [source / "vision_encoder.c"]
+            if (source / "steering.c").is_file():
+                command += [source / "steering.c", source / "json.c"]
             command += [kernel, "-Wl,--gc-sections", "-lm", "-lze_loader", "-o", output]
             run(command)
             return output
